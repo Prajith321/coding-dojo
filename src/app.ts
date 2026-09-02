@@ -104,7 +104,11 @@ async function dbExec(sql: string): Promise<void> {
 app.use(cors());
 app.use(express.json({ limit: "512kb" }));
 app.use(cookieParser());
-app.use(express.static(path.join(process.cwd(), "public")));
+const publicPath = fs.existsSync(path.join(process.cwd(), "public"))
+  ? path.join(process.cwd(), "public")
+  : path.join(__dirname, "..", "public");
+
+app.use(express.static(publicPath));
 
 // HEALTH CHECK ENDPOINTS (INDEPENDENT OF DATABASE & JUDGE0)
 app.get("/api/health", (req, res) => {
@@ -1713,8 +1717,16 @@ app.get("/api/admin/content", authMiddleware, requireRole("admin"), async (req, 
   }
 });
 
-app.get("/{*path}", (req, res) => {
-  res.sendFile(path.join(process.cwd(), "public", "index.html"));
+app.use((req, res, next) => {
+  if (req.method !== "GET") return next();
+  const publicDir = fs.existsSync(path.join(process.cwd(), "public"))
+    ? path.join(process.cwd(), "public")
+    : path.join(__dirname, "..", "public");
+  const requestedFile = path.join(publicDir, req.path);
+  if (req.path !== "/" && fs.existsSync(requestedFile) && fs.statSync(requestedFile).isFile()) {
+    return res.sendFile(requestedFile);
+  }
+  res.sendFile(path.join(publicDir, "index.html"));
 });
 
 export default app;
