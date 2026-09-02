@@ -9,5 +9,5 @@
     "strict": true,
     "skipLibCheck": true
   },
-  "include": ["src/**/*", "api/**/*", "server.ts"]
+  "include": ["src/**/*", "api/**/*", "local.ts"]
 }

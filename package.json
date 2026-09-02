@@ -2,10 +2,11 @@
   "name": "coding-dojo-platform",
   "version": "1.0.0",
   "private": true,
+  "main": "api/index.ts",
   "scripts": {
-    "dev": "tsx server.ts",
+    "dev": "tsx local.ts",
     "build": "tsc",
-    "start": "node dist/server.js"
+    "start": "tsx local.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.113.0",

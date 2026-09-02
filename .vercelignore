@@ -1,0 +1,4 @@
+dist/
+local.ts
+server.ts
+server.js
