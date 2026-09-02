@@ -11,6 +11,7 @@ import os from "os";
 import path from "path";
 
 export const app = express();
+export { supabase } from "./supabase";
 const isProd = process.env.NODE_ENV === "production" || Boolean(process.env.VERCEL);
 
 const JWT_SECRET = process.env.JWT_SECRET || (isProd ? "" : "local-coding-dojo-secret-key-2026");
