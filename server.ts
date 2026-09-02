@@ -4,8 +4,6 @@ import cors from "cors";
 import cookieParser from "cookie-parser";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
-import { createClient } from "@supabase/supabase-js";
-import { DatabaseSync } from "node:sqlite";
 import { Pool } from "pg";
 import { spawn } from "child_process";
 import fs from "fs";
@@ -17,36 +15,42 @@ const PORT = Number(process.env.PORT || 3000);
 const isProd = process.env.NODE_ENV === "production" || Boolean(process.env.VERCEL);
 
 const JWT_SECRET = process.env.JWT_SECRET || (isProd ? "" : "local-coding-dojo-secret-key-2026");
-if (isProd && !JWT_SECRET) {
-  console.error("FATAL CONFIGURATION ERROR: JWT_SECRET environment variable is missing in production!");
-}
 
-const SUPABASE_URL = process.env.SUPABASE_URL || "https://zpgwsqxaxvuxaaiecpja.supabase.co";
-const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_PUBLISHABLE_KEY || "";
-export const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
-
-// DATABASE ABSTRACTION: POSTGRESQL VS SQLITE
+// DATABASE ABSTRACTION: POSTGRESQL (PRODUCTION) VS SQLITE (LOCAL DEV)
 const pgConnectionString = process.env.DATABASE_URL || process.env.POSTGRES_URL || "";
 const isPg = Boolean(pgConnectionString);
 
-if (isProd && !isPg) {
-  console.warn("WARNING: DATABASE_URL environment variable is not defined in production environment!");
+let pgPool: Pool | null = null;
+let sqliteDb: any = null;
+
+function getPgPool(): Pool {
+  if (!pgPool) {
+    if (!pgConnectionString) {
+      throw new Error("DATABASE_URL environment variable is missing for PostgreSQL connection.");
+    }
+    pgPool = new Pool({
+      connectionString: pgConnectionString,
+      ssl: process.env.DISABLE_PG_SSL ? false : { rejectUnauthorized: false }
+    });
+  }
+  return pgPool;
 }
 
-let pgPool: Pool | null = null;
-let sqliteDb: DatabaseSync | null = null;
-
-if (isPg) {
-  pgPool = new Pool({
-    connectionString: pgConnectionString,
-    ssl: process.env.DISABLE_PG_SSL ? false : { rejectUnauthorized: false }
-  });
-} else {
-  const dbPath = process.env.VERCEL
-    ? path.join(os.tmpdir(), "dojo.sqlite")
-    : path.join(process.cwd(), "dojo.sqlite");
-  sqliteDb = new DatabaseSync(dbPath);
-  sqliteDb.exec("PRAGMA journal_mode = WAL;");
+function getSqliteDb(): any {
+  if (!sqliteDb) {
+    try {
+      // Dynamic lazy require to prevent module load crash on Node runtimes without node:sqlite
+      const { DatabaseSync } = require("node:sqlite");
+      const dbPath = process.env.VERCEL
+        ? path.join(os.tmpdir(), "dojo.sqlite")
+        : path.join(process.cwd(), "dojo.sqlite");
+      sqliteDb = new DatabaseSync(dbPath);
+      sqliteDb.exec("PRAGMA journal_mode = WAL;");
+    } catch (err: any) {
+      throw new Error(`SQLite unavailable: ${err.message}. Please configure DATABASE_URL environment variable for PostgreSQL.`);
+    }
+  }
+  return sqliteDb;
 }
 
 function convertSql(sql: string): string {
@@ -56,43 +60,46 @@ function convertSql(sql: string): string {
 }
 
 async function dbAll(sql: string, params: any[] = []): Promise<any[]> {
+  await ensureDbInitialized();
   if (isPg) {
-    const res = await pgPool!.query(convertSql(sql), params);
+    const res = await getPgPool().query(convertSql(sql), params);
     return res.rows;
   } else {
-    return sqliteDb!.prepare(sql).all(...params) as any[];
+    return getSqliteDb().prepare(sql).all(...params) as any[];
   }
 }
 
 async function dbGet(sql: string, params: any[] = []): Promise<any> {
+  await ensureDbInitialized();
   if (isPg) {
-    const res = await pgPool!.query(convertSql(sql), params);
+    const res = await getPgPool().query(convertSql(sql), params);
     return res.rows[0];
   } else {
-    return sqliteDb!.prepare(sql).get(...params);
+    return getSqliteDb().prepare(sql).get(...params);
   }
 }
 
 async function dbRun(sql: string, params: any[] = []): Promise<{ lastInsertRowid: number; changes: number }> {
+  await ensureDbInitialized();
   if (isPg) {
     let querySql = convertSql(sql);
     if (querySql.trim().toUpperCase().startsWith("INSERT") && !querySql.toUpperCase().includes("RETURNING")) {
       querySql += " RETURNING id";
     }
-    const res = await pgPool!.query(querySql, params);
+    const res = await getPgPool().query(querySql, params);
     const id = res.rows[0]?.id ? Number(res.rows[0].id) : 0;
     return { lastInsertRowid: id, changes: res.rowCount || 0 };
   } else {
-    const res = sqliteDb!.prepare(sql).run(...params);
+    const res = getSqliteDb().prepare(sql).run(...params);
     return { lastInsertRowid: Number(res.lastInsertRowid), changes: Number(res.changes) };
   }
 }
 
 async function dbExec(sql: string): Promise<void> {
   if (isPg) {
-    await pgPool!.query(sql);
+    await getPgPool().query(sql);
   } else {
-    sqliteDb!.exec(sql);
+    getSqliteDb().exec(sql);
   }
 }
 
@@ -101,7 +108,7 @@ app.use(express.json({ limit: "512kb" }));
 app.use(cookieParser());
 app.use(express.static(path.join(process.cwd(), "public")));
 
-// HEALTH CHECK ENDPOINTS
+// HEALTH CHECK ENDPOINTS (LIGHTWEIGHT & INDEPENDENT)
 app.get("/api/health", (req, res) => {
   res.json({
     ok: true,
@@ -122,10 +129,24 @@ app.get("/api/health/db", async (req, res) => {
       ok: false,
       database: isPg ? "postgresql" : "sqlite",
       connected: false,
-      error: "Database health probe failed"
+      error: err.message || "Database health check failed"
     });
   }
 });
+
+// LAZY DATABASE INITIALIZATION
+let dbInitPromise: Promise<void> | null = null;
+
+function ensureDbInitialized(): Promise<void> {
+  if (!dbInitPromise) {
+    dbInitPromise = seedDatabase().catch((err) => {
+      console.error("Database initialization / seed error:", err.message);
+      dbInitPromise = null; // allow retry on subsequent requests
+      throw err;
+    });
+  }
+  return dbInitPromise;
+}
 
 // Initialize Database Schema
 async function initSchema() {
@@ -489,16 +510,19 @@ int main() {
     console.log("Database seeded successfully!");
   }
 }
-seedDatabase().catch((err) => console.error("Database seed error:", err));
 
 type AuthReq = express.Request & { user?: any };
 
 function authMiddleware(req: AuthReq, res: express.Response, next: express.NextFunction) {
+  if (isProd && !JWT_SECRET) {
+    return res.status(500).json({ error: "Server configuration error: JWT_SECRET environment variable is not defined." });
+  }
+
   const header = req.headers.authorization;
   const token = header?.startsWith("Bearer ") ? header.slice(7) : req.cookies?.token;
   if (!token) return res.status(401).json({ error: "Authentication required" });
   try {
-    const payload = jwt.verify(token, JWT_SECRET);
+    const payload = jwt.verify(token, JWT_SECRET || "local-coding-dojo-secret-key-2026");
     req.user = payload;
     next();
   } catch {
@@ -746,7 +770,7 @@ app.post("/api/register", async (req, res) => {
       await dbRun("INSERT INTO belt_achievements(user_id,language_id,belt_id) VALUES(?,?,1)", [userId, l.id]);
     }
 
-    const token = jwt.sign({ id: userId, name, email, role: "student" }, JWT_SECRET, { expiresIn: "7d" });
+    const token = jwt.sign({ id: userId, name, email, role: "student" }, JWT_SECRET || "local-coding-dojo-secret-key-2026", { expiresIn: "7d" });
     res.cookie("token", token, { httpOnly: true, sameSite: "lax" });
 
     await logActivity(userId, "register");
@@ -764,7 +788,7 @@ app.post("/api/login", async (req, res) => {
       return res.status(401).json({ error: "Invalid email or password" });
     }
 
-    const token = jwt.sign({ id: u.id, name: u.name, email: u.email, role: u.role }, JWT_SECRET, { expiresIn: "7d" });
+    const token = jwt.sign({ id: u.id, name: u.name, email: u.email, role: u.role }, JWT_SECRET || "local-coding-dojo-secret-key-2026", { expiresIn: "7d" });
     res.cookie("token", token, { httpOnly: true, sameSite: "lax" });
 
     await logActivity(u.id, "login");
