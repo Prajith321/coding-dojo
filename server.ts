@@ -14,7 +14,12 @@ import path from "path";
 
 export const app = express();
 const PORT = Number(process.env.PORT || 3000);
-const JWT_SECRET = process.env.JWT_SECRET || "local-coding-dojo-secret-key-2026";
+const isProd = process.env.NODE_ENV === "production" || Boolean(process.env.VERCEL);
+
+const JWT_SECRET = process.env.JWT_SECRET || (isProd ? "" : "local-coding-dojo-secret-key-2026");
+if (isProd && !JWT_SECRET) {
+  console.error("FATAL CONFIGURATION ERROR: JWT_SECRET environment variable is missing in production!");
+}
 
 const SUPABASE_URL = process.env.SUPABASE_URL || "https://zpgwsqxaxvuxaaiecpja.supabase.co";
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_PUBLISHABLE_KEY || "";
@@ -23,6 +28,10 @@ export const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 // DATABASE ABSTRACTION: POSTGRESQL VS SQLITE
 const pgConnectionString = process.env.DATABASE_URL || process.env.POSTGRES_URL || "";
 const isPg = Boolean(pgConnectionString);
+
+if (isProd && !isPg) {
+  console.warn("WARNING: DATABASE_URL environment variable is not defined in production environment!");
+}
 
 let pgPool: Pool | null = null;
 let sqliteDb: DatabaseSync | null = null;
@@ -92,9 +101,30 @@ app.use(express.json({ limit: "512kb" }));
 app.use(cookieParser());
 app.use(express.static(path.join(process.cwd(), "public")));
 
-// HEALTH ENDPOINT FOR SMOKE TESTING & VERCEL PROBES
+// HEALTH CHECK ENDPOINTS
 app.get("/api/health", (req, res) => {
-  res.json({ ok: true, service: "coding-dojo" });
+  res.json({
+    ok: true,
+    environment: process.env.NODE_ENV || (process.env.VERCEL ? "production" : "development")
+  });
+});
+
+app.get("/api/health/db", async (req, res) => {
+  try {
+    const row = await dbGet("SELECT 1 as connected");
+    res.json({
+      ok: true,
+      database: isPg ? "postgresql" : "sqlite",
+      connected: Boolean(row && (row.connected === 1 || row.connected === "1" || row.connected === true))
+    });
+  } catch (err: any) {
+    res.status(500).json({
+      ok: false,
+      database: isPg ? "postgresql" : "sqlite",
+      connected: false,
+      error: "Database health probe failed"
+    });
+  }
 });
 
 // Initialize Database Schema
@@ -552,7 +582,7 @@ function execProcess(command: string, args: string[], input: string, timeoutMs: 
   });
 }
 
-// LOCAL PROCESS FALLBACK RUNNER
+// LOCAL PROCESS RUNNER (DEVELOPMENT ONLY)
 async function runLocalStudentCode(language: string, code: string, input: string, timeoutMs: number = 3000) {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "dojo-run-"));
   let cmd = "", args: string[] = [], filePath = "";
@@ -613,10 +643,10 @@ async function runLocalStudentCode(language: string, code: string, input: string
   }
 }
 
-// PRODUCTION CODE EXECUTION ARCHITECTURE: JUDGE0 API + LOCAL FALLBACK
+// PRODUCTION CODE EXECUTION ENGINE: JUDGE0 CE SANDBOX API
 async function runStudentCode(language: string, code: string, input: string, timeoutMs: number = 3000) {
-  const judge0Url = process.env.EXECUTION_API_URL || process.env.JUDGE0_API_URL || "https://ce.judge0.com";
-  const judge0Key = process.env.EXECUTION_API_KEY || process.env.JUDGE0_API_KEY || "";
+  const judge0Url = process.env.JUDGE0_URL || process.env.EXECUTION_API_URL || process.env.JUDGE0_API_URL || "https://ce.judge0.com";
+  const judge0Key = process.env.JUDGE0_API_KEY || process.env.EXECUTION_API_KEY || "";
 
   const langIdMap: Record<string, number> = {
     Python: 71,
@@ -629,13 +659,14 @@ async function runStudentCode(language: string, code: string, input: string, tim
 
   if (judge0Url) {
     try {
-      const url = `${judge0Url.replace(/\/$/, "")}/submissions?wait=true&base64_encoded=false`;
+      const baseUrl = judge0Url.replace(/\/$/, "");
+      const url = `${baseUrl}/submissions?wait=true&base64_encoded=false`;
       const headers: Record<string, string> = {
         "Content-Type": "application/json"
       };
       if (judge0Key) {
         headers["X-RapidAPI-Key"] = judge0Key;
-        headers["X-RapidAPI-Host"] = new URL(judge0Url).hostname;
+        headers["X-RapidAPI-Host"] = new URL(baseUrl).hostname;
         headers["X-Auth-Token"] = judge0Key;
       }
 
@@ -657,19 +688,37 @@ async function runStudentCode(language: string, code: string, input: string, tim
         const stdout = data.stdout || "";
         const stderr = data.stderr || data.compile_output || "";
         const statusDescription = data.status?.description || "";
+        const statusCode = data.status?.id;
 
-        const isSuccess = data.status?.id === 3;
-        const outText = stdout || stderr || statusDescription;
+        const isPassed = statusCode === 3; // 3 = Accepted
+        let errorMessage = stderr;
+
+        if (!isPassed && !errorMessage) {
+          errorMessage = statusDescription || "Execution failed";
+        }
+
+        const outputText = stdout || stderr || statusDescription || "No output generated.";
 
         return {
-          passed: isSuccess,
-          error: stderr || (isSuccess ? "" : statusDescription),
-          output: outText
+          passed: isPassed,
+          error: errorMessage,
+          output: outputText
         };
+      } else {
+        const errText = await resp.text();
+        console.error("Judge0 API HTTP error:", resp.status, errText);
       }
     } catch (err: any) {
-      console.warn("Judge0 sandbox execution failed, attempting local fallback if available:", err.message);
+      console.error("Judge0 API invocation error:", err.message);
     }
+  }
+
+  if (isProd) {
+    return {
+      passed: false,
+      error: "Production execution error: Judge0 Sandbox Service is unconfigured or unreachable.",
+      output: "Code execution sandbox unavailable in production environment."
+    };
   }
 
   return runLocalStudentCode(language, code, input, timeoutMs);
