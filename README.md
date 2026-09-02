@@ -18,9 +18,9 @@ A localhost-friendly Coding Dojo MVP with Student, Staff and Admin roles.
 6. Open `http://localhost:3000`.
 
 ## Demo accounts
-- Student: `student@dojo.local` / `student123`
-- Staff: `staff@dojo.local` / `staff123`
-- Admin: `admin@dojo.local` / `admin123`
+- Student: `student@gmail.com` / `student123`
+- Staff: `staff@gmail.com` / `staff123`
+- Admin: `admin@gmail.com` / `admin123`
 
 ## Local runtimes
 The runner detects installed commands:

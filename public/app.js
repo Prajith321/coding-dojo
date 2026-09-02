@@ -297,6 +297,19 @@ function renderAuthPage(type) {
           </button>
         </form>
 
+        ${!isRegister ? `
+          <div style="margin-top: 24px; padding: 14px; background: rgba(255,255,255,0.04); border: 1px solid var(--border-light); border-radius: 8px;">
+            <div style="font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--navy-500); text-align: center; font-weight: 700; margin-bottom: 10px;">
+              ⚡ Quick Fill Credentials:
+            </div>
+            <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px;">
+              <button type="button" class="btn btn-secondary" style="font-size: 12px; padding: 6px;" onclick="fillCredentials('student@gmail.com', 'student123')">Student</button>
+              <button type="button" class="btn btn-secondary" style="font-size: 12px; padding: 6px;" onclick="fillCredentials('staff@gmail.com', 'staff123')">Staff</button>
+              <button type="button" class="btn btn-secondary" style="font-size: 12px; padding: 6px;" onclick="fillCredentials('admin@gmail.com', 'admin123')">Admin</button>
+            </div>
+          </div>
+        ` : ''}
+
         <div style="margin-top: 20px; text-align: center; font-size: 13px;">
           ${isRegister ? `Already have an account? <a href="#" onclick="navigate('/login')">Log in</a>` : `Need an account? <a href="#" onclick="navigate('/register')">Register here</a>`}
         </div>
@@ -304,6 +317,13 @@ function renderAuthPage(type) {
     </div>
   `;
 }
+
+window.fillCredentials = function(email, password) {
+  const emailInput = document.getElementById('auth-email');
+  const passInput = document.getElementById('auth-password');
+  if (emailInput) emailInput.value = email;
+  if (passInput) passInput.value = password;
+};
 
 async function handleAuthSubmit(event, type) {
   event.preventDefault();

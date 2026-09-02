@@ -18,7 +18,7 @@ const JWT_SECRET = process.env.JWT_SECRET || (isProd ? "" : "local-coding-dojo-s
 
 // DATABASE ABSTRACTION: POSTGRESQL (PRODUCTION) VS SQLITE (LOCAL DEV)
 const pgConnectionString = process.env.DATABASE_URL || process.env.POSTGRES_URL || "";
-const isPg = Boolean(pgConnectionString);
+const isPg = Boolean(pgConnectionString && !pgConnectionString.includes("[YOUR-PASSWORD]"));
 
 let pgPool: Pool | null = null;
 let sqliteDb: any = null;
@@ -58,8 +58,7 @@ function convertSql(sql: string): string {
   return sql.replace(/\?/g, () => `$${paramIndex++}`);
 }
 
-async function dbAll(sql: string, params: any[] = []): Promise<any[]> {
-  await ensureDbInitialized();
+async function rawDbAll(sql: string, params: any[] = []): Promise<any[]> {
   if (isPg) {
     const res = await getPgPool().query(convertSql(sql), params);
     return res.rows;
@@ -68,8 +67,7 @@ async function dbAll(sql: string, params: any[] = []): Promise<any[]> {
   }
 }
 
-async function dbGet(sql: string, params: any[] = []): Promise<any> {
-  await ensureDbInitialized();
+async function rawDbGet(sql: string, params: any[] = []): Promise<any> {
   if (isPg) {
     const res = await getPgPool().query(convertSql(sql), params);
     return res.rows[0];
@@ -78,8 +76,7 @@ async function dbGet(sql: string, params: any[] = []): Promise<any> {
   }
 }
 
-async function dbRun(sql: string, params: any[] = []): Promise<{ lastInsertRowid: number; changes: number }> {
-  await ensureDbInitialized();
+async function rawDbRun(sql: string, params: any[] = []): Promise<{ lastInsertRowid: number; changes: number }> {
   if (isPg) {
     let querySql = convertSql(sql);
     if (querySql.trim().toUpperCase().startsWith("INSERT") && !querySql.toUpperCase().includes("RETURNING")) {
@@ -94,12 +91,34 @@ async function dbRun(sql: string, params: any[] = []): Promise<{ lastInsertRowid
   }
 }
 
-async function dbExec(sql: string): Promise<void> {
+async function rawDbExec(sql: string): Promise<void> {
   if (isPg) {
     await getPgPool().query(sql);
   } else {
     getSqliteDb().exec(sql);
   }
+}
+
+let isInitializingDb = false;
+
+async function dbAll(sql: string, params: any[] = []): Promise<any[]> {
+  if (!isInitializingDb) await ensureDbInitialized();
+  return rawDbAll(sql, params);
+}
+
+async function dbGet(sql: string, params: any[] = []): Promise<any> {
+  if (!isInitializingDb) await ensureDbInitialized();
+  return rawDbGet(sql, params);
+}
+
+async function dbRun(sql: string, params: any[] = []): Promise<{ lastInsertRowid: number; changes: number }> {
+  if (!isInitializingDb) await ensureDbInitialized();
+  return rawDbRun(sql, params);
+}
+
+async function dbExec(sql: string): Promise<void> {
+  if (!isInitializingDb) await ensureDbInitialized();
+  return rawDbExec(sql);
 }
 
 app.use(cors());
@@ -142,11 +161,16 @@ let dbInitPromise: Promise<void> | null = null;
 
 function ensureDbInitialized(): Promise<void> {
   if (!dbInitPromise) {
-    dbInitPromise = seedDatabase().catch((err) => {
-      console.error("Database initialization / seed error:", err.message);
-      dbInitPromise = null;
-      throw err;
-    });
+    isInitializingDb = true;
+    dbInitPromise = seedDatabase()
+      .catch((err) => {
+        console.error("Database initialization / seed error:", err.message);
+        dbInitPromise = null;
+        throw err;
+      })
+      .finally(() => {
+        isInitializingDb = false;
+      });
   }
   return dbInitPromise;
 }
@@ -355,21 +379,25 @@ CREATE TABLE IF NOT EXISTS notifications (
 
 async function seedDatabase() {
   await initSchema();
+  await dbRun("UPDATE users SET email='student@gmail.com' WHERE email='student@dojo.local'");
+  await dbRun("UPDATE users SET email='staff@gmail.com' WHERE email='staff@dojo.local'");
+  await dbRun("UPDATE users SET email='admin@gmail.com' WHERE email='admin@dojo.local'");
+
   const userCount = await dbGet("SELECT COUNT(*) c FROM users");
   if (Number(userCount?.c || 0) === 0) {
     console.log("Seeding Coding Dojo Database...");
 
     const today = new Date().toISOString().split('T')[0];
 
-    const resStudent = await dbRun("INSERT INTO users(name,email,password_hash,role,selected_language) VALUES(?,?,?,?,?)", ["Student Arun", "student@dojo.local", bcrypt.hashSync("student123", 10), "student", "Python"]);
+    const resStudent = await dbRun("INSERT INTO users(name,email,password_hash,role,selected_language) VALUES(?,?,?,?,?)", ["Student Arun", "student@gmail.com", bcrypt.hashSync("student123", 10), "student", "Python"]);
     const sId = resStudent.lastInsertRowid;
     await dbRun("INSERT INTO student_profiles(user_id,xp,streak_days,last_active_date,daily_goal_count,daily_goal_date) VALUES(?,?,?,?,?,?)", [sId, 180, 6, today, 2, today]);
 
-    const resStaff = await dbRun("INSERT INTO users(name,email,password_hash,role,selected_language) VALUES(?,?,?,?,?)", ["Staff Priya", "staff@dojo.local", bcrypt.hashSync("staff123", 10), "staff", "Python"]);
+    const resStaff = await dbRun("INSERT INTO users(name,email,password_hash,role,selected_language) VALUES(?,?,?,?,?)", ["Staff Priya", "staff@gmail.com", bcrypt.hashSync("staff123", 10), "staff", "Python"]);
     const stId = resStaff.lastInsertRowid;
     await dbRun("INSERT INTO student_profiles(user_id,xp,streak_days,last_active_date,daily_goal_count,daily_goal_date) VALUES(?,?,?,?,?,?)", [stId, 0, 0, null, 0, null]);
 
-    const resAdmin = await dbRun("INSERT INTO users(name,email,password_hash,role,selected_language) VALUES(?,?,?,?,?)", ["Admin Kumar", "admin@dojo.local", bcrypt.hashSync("admin123", 10), "admin", "Python"]);
+    const resAdmin = await dbRun("INSERT INTO users(name,email,password_hash,role,selected_language) VALUES(?,?,?,?,?)", ["Admin Kumar", "admin@gmail.com", bcrypt.hashSync("admin123", 10), "admin", "Python"]);
     const aId = resAdmin.lastInsertRowid;
     await dbRun("INSERT INTO student_profiles(user_id,xp,streak_days,last_active_date,daily_goal_count,daily_goal_date) VALUES(?,?,?,?,?,?)", [aId, 0, 0, null, 0, null]);
 
