@@ -570,6 +570,19 @@ function requireRole(...allowedRoles: string[]) {
   };
 }
 
+function normalizeLanguageName(name: any): string {
+  const raw = String(name || "");
+  let decoded = raw;
+  try {
+    decoded = decodeURIComponent(raw);
+  } catch {}
+  const trimmed = decoded.trim();
+  if (trimmed === "C++" || trimmed.toLowerCase() === "cpp" || trimmed === "C" || raw.includes("C++") || raw.startsWith("C ") || raw.startsWith("C  ")) {
+    return "C++";
+  }
+  return trimmed;
+}
+
 async function logActivity(userId: number, action: string, meta: any = "") {
   try {
     await dbRun("INSERT INTO activity_logs(user_id,action,meta) VALUES(?,?,?)", [userId, action, JSON.stringify(meta)]);
@@ -870,7 +883,7 @@ app.get("/api/languages", async (req, res) => {
 app.get("/api/languages/:name/belt-details", authMiddleware, async (req: AuthReq, res) => {
   try {
     const uid = req.user.id;
-    const langName = String(req.params.name);
+    const langName = normalizeLanguageName(req.params.name);
 
     const lang: any = await dbGet("SELECT id, name FROM languages WHERE name=?", [langName]);
     if (!lang) return res.status(404).json({ error: "Language not found" });
@@ -904,9 +917,22 @@ app.get("/api/languages/:name/belt-details", authMiddleware, async (req: AuthReq
 
 app.get("/api/topics", authMiddleware, async (req: AuthReq, res) => {
   try {
-    const langName = String(req.query.language || req.user.selected_language || "Python");
+    const langName = normalizeLanguageName(String(req.query.language || req.user.selected_language || "Python"));
+
+    let userBeltOrder = 999;
+    if (req.user.role === "student") {
+      const slb: any = await dbGet(`
+        SELECT b.sort_order
+        FROM student_language_belts slb
+        JOIN belts b ON b.id = slb.current_belt_id
+        JOIN languages l ON l.id = slb.language_id
+        WHERE slb.user_id = ? AND l.name = ?
+      `, [req.user.id, langName]);
+      userBeltOrder = slb ? Number(slb.sort_order) : 1;
+    }
+
     const topics = await dbAll(`
-      SELECT t.*, b.name belt_name, b.color_hex belt_color, l.name language_name,
+      SELECT t.*, b.name belt_name, b.color_hex belt_color, b.sort_order belt_sort_order, l.name language_name,
              CASE WHEN cp.completed_at IS NOT NULL THEN 1 ELSE 0 END completed,
              (SELECT COUNT(*) FROM questions q WHERE q.topic_id = t.id AND q.active=1) question_count
       FROM topics t
@@ -917,7 +943,13 @@ app.get("/api/topics", authMiddleware, async (req: AuthReq, res) => {
       ORDER BY b.sort_order ASC, t.sort_order ASC
     `, [req.user.id, langName]);
 
-    res.json(topics);
+    const enrichedTopics = topics.map(t => ({
+      ...t,
+      locked: req.user.role === "student" ? Number(t.belt_sort_order) > userBeltOrder : false,
+      user_belt_order: userBeltOrder
+    }));
+
+    res.json(enrichedTopics);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -927,7 +959,7 @@ app.get("/api/topics/:id", authMiddleware, async (req: AuthReq, res) => {
   try {
     const tId = Number(req.params.id);
     const topic: any = await dbGet(`
-      SELECT t.*, l.name language_name, b.name belt_name, b.color_hex belt_color
+      SELECT t.*, l.name language_name, b.name belt_name, b.color_hex belt_color, b.sort_order belt_sort_order
       FROM topics t
       JOIN languages l ON l.id = t.language_id
       JOIN belts b ON b.id = t.belt_id
@@ -935,6 +967,20 @@ app.get("/api/topics/:id", authMiddleware, async (req: AuthReq, res) => {
     `, [tId]);
 
     if (!topic) return res.status(404).json({ error: "Topic not found" });
+
+    // Belt lock check for students: students can only access same or lower belt level
+    if (req.user.role === "student") {
+      const slb: any = await dbGet(`
+        SELECT b.sort_order
+        FROM student_language_belts slb
+        JOIN belts b ON b.id = slb.current_belt_id
+        WHERE slb.user_id = ? AND slb.language_id = ?
+      `, [req.user.id, topic.language_id]);
+      const userBeltOrder = slb ? Number(slb.sort_order) : 1;
+      if (Number(topic.belt_sort_order) > userBeltOrder) {
+        return res.status(403).json({ error: `🔒 This topic is locked. Reach ${topic.belt_name} rank to unlock this content.` });
+      }
+    }
 
     await dbRun("INSERT INTO content_progress(user_id,topic_id) VALUES(?,?) ON CONFLICT DO NOTHING", [req.user.id, topic.id]);
     const questions = await dbAll(`
@@ -967,7 +1013,7 @@ app.post("/api/topics/:id/complete", authMiddleware, async (req: AuthReq, res) =
 // BELT PROMOTION EXAM & TEST CASE EVALUATION
 app.post("/api/belt-promotion/request", authMiddleware, async (req: AuthReq, res) => {
   try {
-    const { language } = req.body || {};
+    const language = normalizeLanguageName(req.body?.language);
     const uid = req.user.id;
 
     const lang: any = await dbGet("SELECT id FROM languages WHERE name=?", [language]);
@@ -1003,7 +1049,7 @@ app.post("/api/belt-promotion/request", authMiddleware, async (req: AuthReq, res
 app.get("/api/belt-test/exam", authMiddleware, async (req: AuthReq, res) => {
   try {
     const uid = req.user.id;
-    const langName = String(req.query.language || "Python");
+    const langName = normalizeLanguageName(String(req.query.language || "Python"));
 
     const lang: any = await dbGet("SELECT id, name FROM languages WHERE name=?", [langName]);
     if (!lang) return res.status(404).json({ error: "Language not found" });
@@ -1103,7 +1149,8 @@ app.post("/api/belt-test/run-question", authMiddleware, async (req: AuthReq, res
 app.post("/api/belt-test/submit", authMiddleware, async (req: AuthReq, res) => {
   try {
     const uid = req.user.id;
-    const { language, answers } = req.body || {};
+    const { answers } = req.body || {};
+    const language = normalizeLanguageName(req.body?.language);
 
     const lang: any = await dbGet("SELECT id, name FROM languages WHERE name=?", [language]);
     if (!lang) return res.status(400).json({ error: "Invalid language" });
@@ -1310,7 +1357,7 @@ app.get("/api/questions/:id", authMiddleware, async (req: AuthReq, res) => {
   try {
     const qId = Number(req.params.id);
     const q: any = await dbGet(`
-      SELECT q.*, t.name topic_name, l.name language_name, b.name belt_name
+      SELECT q.*, t.name topic_name, l.name language_name, l.id language_id, b.name belt_name, b.sort_order belt_sort_order
       FROM questions q
       JOIN topics t ON t.id = q.topic_id
       JOIN languages l ON l.id = t.language_id
@@ -1319,6 +1366,20 @@ app.get("/api/questions/:id", authMiddleware, async (req: AuthReq, res) => {
     `, [qId]);
 
     if (!q) return res.status(404).json({ error: "Question not found" });
+
+    // Belt lock check for students
+    if (req.user.role === "student") {
+      const slb: any = await dbGet(`
+        SELECT b.sort_order
+        FROM student_language_belts slb
+        JOIN belts b ON b.id = slb.current_belt_id
+        WHERE slb.user_id = ? AND slb.language_id = ?
+      `, [req.user.id, q.language_id]);
+      const userBeltOrder = slb ? Number(slb.sort_order) : 1;
+      if (Number(q.belt_sort_order) > userBeltOrder) {
+        return res.status(403).json({ error: `🔒 This question belongs to ${q.belt_name} tier. Advance your belt level to unlock it.` });
+      }
+    }
 
     const visibleCases = await dbAll("SELECT id, input, expected_output, timeout_ms FROM test_cases WHERE question_id=? AND visible=1 ORDER BY id ASC", [q.id]);
     const hiddenCount = Number((await dbGet("SELECT COUNT(*) c FROM test_cases WHERE question_id=? AND visible=0", [q.id]))?.c || 0);
@@ -1341,11 +1402,35 @@ app.get("/api/questions/:id", authMiddleware, async (req: AuthReq, res) => {
 
 app.post("/api/questions/:id/run", authMiddleware, async (req: AuthReq, res) => {
   try {
-    const { code, language } = req.body || {};
+    const { code } = req.body || {};
+    const language = normalizeLanguageName(req.body?.language || "Python");
     const qId = Number(req.params.id);
 
     const q: any = await dbGet("SELECT * FROM questions WHERE id=? AND active=1", [qId]);
     if (!q) return res.status(404).json({ error: "Question not found" });
+
+    // Belt lock check for students
+    if (req.user.role === "student") {
+      const qBelt: any = await dbGet(`
+        SELECT b.sort_order, b.name belt_name, t.language_id
+        FROM questions q
+        JOIN topics t ON t.id = q.topic_id
+        JOIN belts b ON b.id = t.belt_id
+        WHERE q.id = ?
+      `, [qId]);
+      if (qBelt) {
+        const slb: any = await dbGet(`
+          SELECT b.sort_order
+          FROM student_language_belts slb
+          JOIN belts b ON b.id = slb.current_belt_id
+          WHERE slb.user_id = ? AND slb.language_id = ?
+        `, [req.user.id, qBelt.language_id]);
+        const userBeltOrder = slb ? Number(slb.sort_order) : 1;
+        if (Number(qBelt.sort_order) > userBeltOrder) {
+          return res.status(403).json({ error: `🔒 Cannot run: Question is locked in ${qBelt.belt_name} tier.` });
+        }
+      }
+    }
 
     const allTestCases = await dbAll("SELECT * FROM test_cases WHERE question_id=? ORDER BY visible DESC, id ASC", [qId]);
 
@@ -1398,11 +1483,35 @@ app.post("/api/questions/:id/run", authMiddleware, async (req: AuthReq, res) => 
 
 app.post("/api/questions/:id/submit", authMiddleware, async (req: AuthReq, res) => {
   try {
-    const { code, language } = req.body || {};
+    const { code } = req.body || {};
+    const language = normalizeLanguageName(req.body?.language || "Python");
     const qId = Number(req.params.id);
 
     const q: any = await dbGet("SELECT * FROM questions WHERE id=? AND active=1", [qId]);
     if (!q) return res.status(404).json({ error: "Question not found" });
+
+    // Belt lock check for students
+    if (req.user.role === "student") {
+      const qBelt: any = await dbGet(`
+        SELECT b.sort_order, b.name belt_name, t.language_id
+        FROM questions q
+        JOIN topics t ON t.id = q.topic_id
+        JOIN belts b ON b.id = t.belt_id
+        WHERE q.id = ?
+      `, [qId]);
+      if (qBelt) {
+        const slb: any = await dbGet(`
+          SELECT b.sort_order
+          FROM student_language_belts slb
+          JOIN belts b ON b.id = slb.current_belt_id
+          WHERE slb.user_id = ? AND slb.language_id = ?
+        `, [req.user.id, qBelt.language_id]);
+        const userBeltOrder = slb ? Number(slb.sort_order) : 1;
+        if (Number(qBelt.sort_order) > userBeltOrder) {
+          return res.status(403).json({ error: `🔒 Cannot submit: Question is locked in ${qBelt.belt_name} tier.` });
+        }
+      }
+    }
 
     const allTestCases = await dbAll("SELECT * FROM test_cases WHERE question_id=? ORDER BY id ASC", [qId]);
 

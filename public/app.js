@@ -104,35 +104,41 @@ async function initRoute() {
   if (p === '/belt-test' && state.user) {
     try {
       const lang = state.selectedLanguage || 'Python';
-      state.beltExamData = await api(`/api/belt-test/exam?language=${lang}`);
+      state.beltExamData = await api(`/api/belt-test/exam?language=${encodeURIComponent(lang)}`);
       state.beltExamActiveTab = 0;
       state.beltExamAnswers = {};
       state.beltExamResults = {};
-    } catch {
-      showToast('No active approved promotion exam found.', 'error');
+    } catch (err) {
+      showToast(err.message || 'No active approved promotion exam found.', 'error');
       return navigate('/dashboard');
     }
   } else if (p.startsWith('/lesson/')) {
     const id = p.split('/')[2];
     if (id) {
       try {
-        state.currentTopic = await api(`/api/topics/${id}`, { silent: true });
-      } catch {}
+        state.currentTopic = await api(`/api/topics/${id}`);
+      } catch (err) {
+        showToast(err.message || 'Topic is locked or unavailable', 'error');
+        return navigate('/dashboard');
+      }
     }
   } else if (p.startsWith('/question/')) {
     const id = p.split('/')[2];
     if (id) {
       try {
-        state.currentQuestion = await api(`/api/questions/${id}`, { silent: true });
+        state.currentQuestion = await api(`/api/questions/${id}`);
         state.questionTestResults = null;
         state.userTypedCode = null; // Reset typed code so it opens empty initially
-      } catch {}
+      } catch (err) {
+        showToast(err.message || 'Problem is locked or unavailable', 'error');
+        return navigate('/dashboard');
+      }
     }
   } else if (p === '/dashboard' && state.user) {
     try {
-      const lang = state.selectedLanguage;
-      state.languageBeltDetails = await api(`/api/languages/${lang}/belt-details`, { silent: true });
-      state.topics = await api(`/api/topics?language=${lang}`, { silent: true });
+      const lang = state.selectedLanguage || 'Python';
+      state.languageBeltDetails = await api(`/api/languages/${encodeURIComponent(lang)}/belt-details`, { silent: true });
+      state.topics = await api(`/api/topics?language=${encodeURIComponent(lang)}`, { silent: true });
       state.progressData = await api('/api/progress', { silent: true });
     } catch {}
   } else if (p === '/progress' && state.user) {
@@ -523,23 +529,38 @@ function renderStudentDashboard() {
 
       <h2 style="font-size: 20px; font-weight: 800; margin-bottom: 16px;">${currentLang} Belt Topics (3 Questions Per Topic)</h2>
       <div class="grid-cols-3">
-        ${(state.topics || []).map(t => `
-          <div class="card" style="display: flex; flex-direction: column; justify-content: space-between; border-top: 3px solid ${t.belt_color || '#E2E8F0'};">
+        ${(state.topics || []).map(t => {
+          const isLocked = Boolean(t.locked);
+          return `
+          <div class="card" style="display: flex; flex-direction: column; justify-content: space-between; border-top: 3px solid ${isLocked ? '#94A3B8' : (t.belt_color || '#E2E8F0')}; ${isLocked ? 'opacity: 0.85; background: #F8FAFC;' : ''}">
             <div>
               <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
                 <span class="belt-chip" style="background: ${t.belt_color || '#E2E8F0'}; color: #0F172A; font-size: 11px;">🥋 ${t.belt_name}</span>
-                <span class="status-badge ${t.completed ? 'passed' : 'failed'}" style="${t.completed ? '' : 'background: #F1F5F9; color: #64748B;'}">
-                  ${t.completed ? '✓ Completed' : 'Available'}
-                </span>
+                ${isLocked ? `
+                  <span class="status-badge" style="background: #F1F5F9; color: #64748B; border: 1px solid #CBD5E1; font-weight: 700;">
+                    <i class="fa-solid fa-lock"></i> Locked
+                  </span>
+                ` : `
+                  <span class="status-badge ${t.completed ? 'passed' : 'failed'}" style="${t.completed ? '' : 'background: #F1F5F9; color: #64748B;'}">
+                    ${t.completed ? '✓ Completed' : 'Available'}
+                  </span>
+                `}
               </div>
-              <h3 style="font-size: 17px; font-weight: 700; margin-bottom: 6px;">${t.name}</h3>
-              <p style="font-size: 13px; color: var(--navy-600); margin-bottom: 16px;">${t.description}</p>
+              <h3 style="font-size: 17px; font-weight: 700; margin-bottom: 6px; ${isLocked ? 'color: #64748B;' : ''}">${t.name}</h3>
+              <p style="font-size: 13px; color: ${isLocked ? '#94A3B8' : 'var(--navy-600)'}; margin-bottom: 16px;">${t.description}</p>
             </div>
-            <button class="btn ${t.completed ? 'btn-secondary' : 'btn-primary'}" style="width: 100%;" onclick="navigate('/lesson/${t.id}')">
-              ${t.completed ? 'Review Lesson' : 'Start Topic Lesson'} <i class="fa-solid fa-arrow-right"></i>
-            </button>
+            ${isLocked ? `
+              <button class="btn btn-secondary" style="width: 100%; opacity: 0.75; cursor: not-allowed; background: #E2E8F0; color: #64748B; border: none;" onclick="showToast('🔒 Locked: Advance to ${t.belt_name} rank to unlock these problems!', 'error')">
+                <i class="fa-solid fa-lock"></i> Locked (${t.belt_name})
+              </button>
+            ` : `
+              <button class="btn ${t.completed ? 'btn-secondary' : 'btn-primary'}" style="width: 100%;" onclick="navigate('/lesson/${t.id}')">
+                ${t.completed ? 'Review Lesson' : 'Start Topic Lesson'} <i class="fa-solid fa-arrow-right"></i>
+              </button>
+            `}
           </div>
-        `).join('')}
+        `;
+        }).join('')}
       </div>
     </div>
   `;
@@ -547,8 +568,8 @@ function renderStudentDashboard() {
 
 async function changeDashboardLanguage(langName) {
   state.selectedLanguage = langName;
-  state.languageBeltDetails = await api(`/api/languages/${langName}/belt-details`, { silent: true });
-  state.topics = await api(`/api/topics?language=${langName}`, { silent: true });
+  state.languageBeltDetails = await api(`/api/languages/${encodeURIComponent(langName)}/belt-details`, { silent: true });
+  state.topics = await api(`/api/topics?language=${encodeURIComponent(langName)}`, { silent: true });
   render();
 }
 
@@ -556,7 +577,7 @@ async function requestBeltPromotion(langName) {
   try {
     const res = await api('/api/belt-promotion/request', { method: 'POST', body: { language: langName } });
     showToast(res.message);
-    state.languageBeltDetails = await api(`/api/languages/${langName}/belt-details`, { silent: true });
+    state.languageBeltDetails = await api(`/api/languages/${encodeURIComponent(langName)}/belt-details`, { silent: true });
     render();
   } catch {}
 }
@@ -624,11 +645,19 @@ function renderBeltPromotionExamPage() {
           </div>
 
           <div class="editor-panel">
-            <div class="editor-toolbar">
+            <div class="editor-toolbar" style="display: flex; justify-content: space-between; align-items: center;">
               <span><i class="fa-solid fa-code"></i> Type Exam Solution (Question ${activeIdx + 1})</span>
+              <span style="font-size: 11px; color: var(--amber-500); font-weight: 700;"><i class="fa-solid fa-shield-halved"></i> Anti-Cheat Active</span>
             </div>
 
-            <textarea id="exam-editor-${currentQ.id}" class="code-textarea" spellcheck="false" placeholder="Type solution here..." oninput="state.beltExamAnswers[${currentQ.id}] = this.value">${state.beltExamAnswers[currentQ.id] || ''}</textarea>
+            <textarea id="exam-editor-${currentQ.id}" class="code-textarea" spellcheck="false" placeholder="Type solution here..."
+              oninput="state.beltExamAnswers[${currentQ.id}] = this.value"
+              onpaste="event.preventDefault(); showToast('⚠️ Copy/Paste is disabled while coding to ensure honest practice!', 'error'); return false;"
+              oncopy="event.preventDefault(); showToast('⚠️ Copying code is disabled in Coding Dojo!', 'error'); return false;"
+              oncut="event.preventDefault(); return false;"
+              oncontextmenu="event.preventDefault(); return false;"
+              onkeydown="if ((event.ctrlKey || event.metaKey) && ['v','V','c','C','x','X','insert','Insert'].includes(event.key)) { event.preventDefault(); showToast('⚠️ Keyboard shortcuts for copy/paste are disabled!', 'error'); return false; }"
+            >${state.beltExamAnswers[currentQ.id] || ''}</textarea>
 
             <div class="editor-actions">
               <button class="btn btn-accent" onclick="runExamQuestionTests(${currentQ.id}, '${exam.language.name}')">
@@ -745,13 +774,22 @@ function renderLessonPage() {
         </div>
       </div>
 
-      <div class="card" style="text-align: center; padding: 28px;">
-        <h3 style="font-size: 20px; font-weight: 800; margin-bottom: 8px;">Ready to Solve Questions?</h3>
-        <p style="color: var(--navy-600); font-size: 14px; margin-bottom: 20px;">There are 3 separate practice questions available for this topic.</p>
-        <button class="btn btn-accent" style="padding: 12px 36px; font-size: 16px;" onclick="completeLessonAndPractice(${t.id})">
-          <i class="fa-solid fa-vial-circle-check"></i> Start Test & Solve Questions
-        </button>
-      </div>
+      ${t.locked ? `
+        <div class="card" style="text-align: center; padding: 28px; background: #FEF2F2; border: 1px solid #FCA5A5;">
+          <h3 style="font-size: 20px; font-weight: 800; color: #DC2626; margin-bottom: 8px;">
+            <i class="fa-solid fa-lock"></i> Topic Locked (${t.belt_name})
+          </h3>
+          <p style="color: #7F1D1D; font-size: 14px;">This topic and its problems are locked. You must advance to <strong>${t.belt_name}</strong> rank to solve questions from this tier.</p>
+        </div>
+      ` : `
+        <div class="card" style="text-align: center; padding: 28px;">
+          <h3 style="font-size: 20px; font-weight: 800; margin-bottom: 8px;">Ready to Solve Questions?</h3>
+          <p style="color: var(--navy-600); font-size: 14px; margin-bottom: 20px;">There are 3 separate practice questions available for this topic.</p>
+          <button class="btn btn-accent" style="padding: 12px 36px; font-size: 16px;" onclick="completeLessonAndPractice(${t.id})">
+            <i class="fa-solid fa-vial-circle-check"></i> Start Test & Solve Questions
+          </button>
+        </div>
+      `}
     </div>
   `;
 }
@@ -808,11 +846,19 @@ function renderPracticeArena() {
         </div>
 
         <div class="editor-panel">
-          <div class="editor-toolbar">
+          <div class="editor-toolbar" style="display: flex; justify-content: space-between; align-items: center;">
             <span><i class="fa-solid fa-code"></i> Type Your Solution (${userLang})</span>
+            <span style="font-size: 11px; color: var(--amber-500); font-weight: 700;"><i class="fa-solid fa-shield-halved"></i> Anti-Cheat Active</span>
           </div>
 
-          <textarea id="code-editor" class="code-textarea" spellcheck="false" placeholder="Type solution here..." oninput="state.userTypedCode = this.value">${currentCode}</textarea>
+          <textarea id="code-editor" class="code-textarea" spellcheck="false" placeholder="Type solution here..."
+            oninput="state.userTypedCode = this.value"
+            onpaste="event.preventDefault(); showToast('⚠️ Copy/Paste is disabled while coding to ensure honest practice!', 'error'); return false;"
+            oncopy="event.preventDefault(); showToast('⚠️ Copying code is disabled in Coding Dojo!', 'error'); return false;"
+            oncut="event.preventDefault(); return false;"
+            oncontextmenu="event.preventDefault(); return false;"
+            onkeydown="if ((event.ctrlKey || event.metaKey) && ['v','V','c','C','x','X','insert','Insert'].includes(event.key)) { event.preventDefault(); showToast('⚠️ Keyboard shortcuts for copy/paste are disabled!', 'error'); return false; }"
+          >${currentCode}</textarea>
 
           <div class="editor-actions">
             <button class="btn btn-secondary" style="padding: 8px 16px; background: var(--navy-700); color: white; border: none;" onclick="state.userTypedCode = ''; render();">
@@ -1430,5 +1476,41 @@ function renderAdminContentOverview(content) {
     </div>
   `;
 }
+
+// ANTI-CHEAT: Global interceptors to prevent copy, paste, cut, and drag-and-drop code injection
+document.addEventListener('paste', (e) => {
+  const target = e.target;
+  if (target && (target.classList?.contains('code-textarea') || target.id === 'code-editor' || target.id?.startsWith('exam-editor-'))) {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    showToast('⚠️ Copy/Paste is disabled while coding to ensure honest practice!', 'error');
+  }
+}, true);
+
+document.addEventListener('copy', (e) => {
+  const target = e.target;
+  if (target && (target.classList?.contains('code-textarea') || target.id === 'code-editor' || target.id?.startsWith('exam-editor-'))) {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    showToast('⚠️ Copying code is disabled in Coding Dojo!', 'error');
+  }
+}, true);
+
+document.addEventListener('cut', (e) => {
+  const target = e.target;
+  if (target && (target.classList?.contains('code-textarea') || target.id === 'code-editor' || target.id?.startsWith('exam-editor-'))) {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+  }
+}, true);
+
+document.addEventListener('drop', (e) => {
+  const target = e.target;
+  if (target && (target.classList?.contains('code-textarea') || target.id === 'code-editor' || target.id?.startsWith('exam-editor-'))) {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    showToast('⚠️ Drag & drop code pasting is disabled!', 'error');
+  }
+}, true);
 
 window.addEventListener('DOMContentLoaded', init);
