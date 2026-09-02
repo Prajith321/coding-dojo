@@ -6,6 +6,7 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { createClient } from "@supabase/supabase-js";
 import { DatabaseSync } from "node:sqlite";
+import { Pool } from "pg";
 import { spawn } from "child_process";
 import fs from "fs";
 import os from "os";
@@ -19,36 +20,90 @@ const SUPABASE_URL = process.env.SUPABASE_URL || "https://zpgwsqxaxvuxaaiecpja.s
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_PUBLISHABLE_KEY || "";
 export const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-const dbPath = process.env.VERCEL
-  ? path.join(os.tmpdir(), "dojo.sqlite")
-  : path.join(process.cwd(), "dojo.sqlite");
+// DATABASE ABSTRACTION: POSTGRESQL VS SQLITE
+const pgConnectionString = process.env.DATABASE_URL || process.env.POSTGRES_URL || "";
+const isPg = Boolean(pgConnectionString);
 
-const db = new DatabaseSync(dbPath);
-db.exec("PRAGMA journal_mode = WAL;");
+let pgPool: Pool | null = null;
+let sqliteDb: DatabaseSync | null = null;
 
-(db as any).transaction = function<T extends (...args: any[]) => any>(fn: T): T {
-  return ((...args: any[]) => {
-    db.exec("BEGIN");
-    try {
-      const res = fn(...args);
-      db.exec("COMMIT");
-      return res;
-    } catch (err) {
-      db.exec("ROLLBACK");
-      throw err;
+if (isPg) {
+  pgPool = new Pool({
+    connectionString: pgConnectionString,
+    ssl: process.env.DISABLE_PG_SSL ? false : { rejectUnauthorized: false }
+  });
+} else {
+  const dbPath = process.env.VERCEL
+    ? path.join(os.tmpdir(), "dojo.sqlite")
+    : path.join(process.cwd(), "dojo.sqlite");
+  sqliteDb = new DatabaseSync(dbPath);
+  sqliteDb.exec("PRAGMA journal_mode = WAL;");
+}
+
+function convertSql(sql: string): string {
+  if (!isPg) return sql;
+  let paramIndex = 1;
+  return sql.replace(/\?/g, () => `$${paramIndex++}`);
+}
+
+async function dbAll(sql: string, params: any[] = []): Promise<any[]> {
+  if (isPg) {
+    const res = await pgPool!.query(convertSql(sql), params);
+    return res.rows;
+  } else {
+    return sqliteDb!.prepare(sql).all(...params) as any[];
+  }
+}
+
+async function dbGet(sql: string, params: any[] = []): Promise<any> {
+  if (isPg) {
+    const res = await pgPool!.query(convertSql(sql), params);
+    return res.rows[0];
+  } else {
+    return sqliteDb!.prepare(sql).get(...params);
+  }
+}
+
+async function dbRun(sql: string, params: any[] = []): Promise<{ lastInsertRowid: number; changes: number }> {
+  if (isPg) {
+    let querySql = convertSql(sql);
+    if (querySql.trim().toUpperCase().startsWith("INSERT") && !querySql.toUpperCase().includes("RETURNING")) {
+      querySql += " RETURNING id";
     }
-  }) as T;
-};
+    const res = await pgPool!.query(querySql, params);
+    const id = res.rows[0]?.id ? Number(res.rows[0].id) : 0;
+    return { lastInsertRowid: id, changes: res.rowCount || 0 };
+  } else {
+    const res = sqliteDb!.prepare(sql).run(...params);
+    return { lastInsertRowid: Number(res.lastInsertRowid), changes: Number(res.changes) };
+  }
+}
+
+async function dbExec(sql: string): Promise<void> {
+  if (isPg) {
+    await pgPool!.query(sql);
+  } else {
+    sqliteDb!.exec(sql);
+  }
+}
 
 app.use(cors());
 app.use(express.json({ limit: "512kb" }));
 app.use(cookieParser());
 app.use(express.static(path.join(process.cwd(), "public")));
 
-// Initialize Schema
-db.exec(`
+// HEALTH ENDPOINT FOR SMOKE TESTING & VERCEL PROBES
+app.get("/api/health", (req, res) => {
+  res.json({ ok: true, service: "coding-dojo" });
+});
+
+// Initialize Database Schema
+async function initSchema() {
+  const pkType = isPg ? "SERIAL PRIMARY KEY" : "INTEGER PRIMARY KEY AUTOINCREMENT";
+
+  await dbExec(`
 CREATE TABLE IF NOT EXISTS users (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id ${pkType},
   name TEXT NOT NULL,
   email TEXT UNIQUE NOT NULL,
   password_hash TEXT NOT NULL,
@@ -64,12 +119,11 @@ CREATE TABLE IF NOT EXISTS student_profiles (
   streak_days INTEGER NOT NULL DEFAULT 0,
   last_active_date TEXT,
   daily_goal_count INTEGER NOT NULL DEFAULT 0,
-  daily_goal_date TEXT,
-  FOREIGN KEY(user_id) REFERENCES users(id)
+  daily_goal_date TEXT
 );
 
 CREATE TABLE IF NOT EXISTS languages (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id ${pkType},
   name TEXT UNIQUE NOT NULL,
   icon TEXT DEFAULT 'code',
   description TEXT DEFAULT '',
@@ -78,7 +132,7 @@ CREATE TABLE IF NOT EXISTS languages (
 );
 
 CREATE TABLE IF NOT EXISTS belts (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id ${pkType},
   name TEXT NOT NULL,
   color_hex TEXT NOT NULL,
   sort_order INTEGER NOT NULL,
@@ -95,7 +149,7 @@ CREATE TABLE IF NOT EXISTS student_language_belts (
 );
 
 CREATE TABLE IF NOT EXISTS belt_promotion_requests (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id ${pkType},
   user_id INTEGER NOT NULL,
   language_id INTEGER NOT NULL,
   current_belt_id INTEGER NOT NULL,
@@ -107,7 +161,7 @@ CREATE TABLE IF NOT EXISTS belt_promotion_requests (
 );
 
 CREATE TABLE IF NOT EXISTS topics (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id ${pkType},
   language_id INTEGER NOT NULL,
   belt_id INTEGER NOT NULL DEFAULT 1,
   name TEXT NOT NULL,
@@ -122,7 +176,7 @@ CREATE TABLE IF NOT EXISTS topics (
 );
 
 CREATE TABLE IF NOT EXISTS questions (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id ${pkType},
   topic_id INTEGER NOT NULL,
   title TEXT NOT NULL,
   statement TEXT NOT NULL,
@@ -146,7 +200,7 @@ CREATE TABLE IF NOT EXISTS questions (
 );
 
 CREATE TABLE IF NOT EXISTS test_cases (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id ${pkType},
   question_id INTEGER NOT NULL,
   input TEXT NOT NULL,
   expected_output TEXT NOT NULL,
@@ -172,7 +226,7 @@ CREATE TABLE IF NOT EXISTS question_progress (
 );
 
 CREATE TABLE IF NOT EXISTS submissions (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id ${pkType},
   user_id INTEGER NOT NULL,
   question_id INTEGER NOT NULL,
   language TEXT NOT NULL,
@@ -194,7 +248,7 @@ CREATE TABLE IF NOT EXISTS belt_achievements (
 );
 
 CREATE TABLE IF NOT EXISTS achievements (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id ${pkType},
   code TEXT UNIQUE NOT NULL,
   title TEXT NOT NULL,
   description TEXT NOT NULL,
@@ -218,7 +272,7 @@ CREATE TABLE IF NOT EXISTS bookmarks (
 );
 
 CREATE TABLE IF NOT EXISTS staff_notes (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id ${pkType},
   student_id INTEGER NOT NULL,
   staff_id INTEGER NOT NULL,
   note TEXT NOT NULL,
@@ -226,7 +280,7 @@ CREATE TABLE IF NOT EXISTS staff_notes (
 );
 
 CREATE TABLE IF NOT EXISTS activity_logs (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id ${pkType},
   user_id INTEGER NOT NULL,
   action TEXT NOT NULL,
   meta TEXT NOT NULL DEFAULT '',
@@ -234,7 +288,7 @@ CREATE TABLE IF NOT EXISTS activity_logs (
 );
 
 CREATE TABLE IF NOT EXISTS notifications (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id ${pkType},
   user_id INTEGER NOT NULL,
   title TEXT NOT NULL,
   message TEXT NOT NULL,
@@ -243,32 +297,28 @@ CREATE TABLE IF NOT EXISTS notifications (
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 `);
+}
 
-// Seed Database
-function seedDatabase() {
-  const userCount = db.prepare("SELECT COUNT(*) c FROM users").get() as any;
-  if (userCount.c === 0) {
+async function seedDatabase() {
+  await initSchema();
+  const userCount = await dbGet("SELECT COUNT(*) c FROM users");
+  if (Number(userCount?.c || 0) === 0) {
     console.log("Seeding Coding Dojo Database...");
-    
-    const addUser = db.prepare("INSERT INTO users(name,email,password_hash,role,selected_language) VALUES(?,?,?,?,?)");
-    const addProfile = db.prepare("INSERT INTO student_profiles(user_id,xp,streak_days,last_active_date,daily_goal_count,daily_goal_date) VALUES(?,?,?,?,?,?)");
-    
+
     const today = new Date().toISOString().split('T')[0];
-    
-    const resStudent = addUser.run("Student Arun", "student@dojo.local", bcrypt.hashSync("student123", 10), "student", "Python");
-    const sId = Number(resStudent.lastInsertRowid);
-    addProfile.run(sId, 180, 6, today, 2, today);
-    
-    const resStaff = addUser.run("Staff Priya", "staff@dojo.local", bcrypt.hashSync("staff123", 10), "staff", "Python");
-    const stId = Number(resStaff.lastInsertRowid);
-    addProfile.run(stId, 0, 0, null, 0, null);
 
-    const resAdmin = addUser.run("Admin Kumar", "admin@dojo.local", bcrypt.hashSync("admin123", 10), "admin", "Python");
-    const aId = Number(resAdmin.lastInsertRowid);
-    addProfile.run(aId, 0, 0, null, 0, null);
+    const resStudent = await dbRun("INSERT INTO users(name,email,password_hash,role,selected_language) VALUES(?,?,?,?,?)", ["Student Arun", "student@dojo.local", bcrypt.hashSync("student123", 10), "student", "Python"]);
+    const sId = resStudent.lastInsertRowid;
+    await dbRun("INSERT INTO student_profiles(user_id,xp,streak_days,last_active_date,daily_goal_count,daily_goal_date) VALUES(?,?,?,?,?,?)", [sId, 180, 6, today, 2, today]);
 
-    // Seed Belts
-    const insBelt = db.prepare("INSERT INTO belts(name,color_hex,sort_order,xp_required,required_questions,description) VALUES(?,?,?,?,?,?)");
+    const resStaff = await dbRun("INSERT INTO users(name,email,password_hash,role,selected_language) VALUES(?,?,?,?,?)", ["Staff Priya", "staff@dojo.local", bcrypt.hashSync("staff123", 10), "staff", "Python"]);
+    const stId = resStaff.lastInsertRowid;
+    await dbRun("INSERT INTO student_profiles(user_id,xp,streak_days,last_active_date,daily_goal_count,daily_goal_date) VALUES(?,?,?,?,?,?)", [stId, 0, 0, null, 0, null]);
+
+    const resAdmin = await dbRun("INSERT INTO users(name,email,password_hash,role,selected_language) VALUES(?,?,?,?,?)", ["Admin Kumar", "admin@dojo.local", bcrypt.hashSync("admin123", 10), "admin", "Python"]);
+    const aId = resAdmin.lastInsertRowid;
+    await dbRun("INSERT INTO student_profiles(user_id,xp,streak_days,last_active_date,daily_goal_count,daily_goal_date) VALUES(?,?,?,?,?,?)", [aId, 0, 0, null, 0, null]);
+
     const beltList = [
       ["White Belt", "#E2E8F0", 1, 0, 3, "Foundation of programming fundamentals, variables, and standard I/O."],
       ["Yellow Belt", "#F59E0B", 2, 200, 3, "Basic conditions, branching logic, and decision making."],
@@ -279,40 +329,32 @@ function seedDatabase() {
       ["Brown Belt", "#78350F", 7, 2800, 5, "Nested loops, 2D matrices, and search algorithms."],
       ["Black Belt", "#0F172A", 8, 4000, 6, "Mastery of problem solving, data structures, and optimization."]
     ];
-    for (const b of beltList) insBelt.run(b[0], b[1], b[2], b[3], b[4], b[5]);
+    for (const b of beltList) {
+      await dbRun("INSERT INTO belts(name,color_hex,sort_order,xp_required,required_questions,description) VALUES(?,?,?,?,?,?)", b);
+    }
 
-    // Seed Languages
-    const insLang = db.prepare("INSERT INTO languages(name,icon,description,difficulty) VALUES(?,?,?,?)");
-    insLang.run("Python", "snake", "Clean, highly readable code.", "Beginner");
-    insLang.run("JavaScript", "code-js", "The language of the web.", "Beginner");
-    insLang.run("C++", "cpu", "Fast, high-performance language.", "Intermediate");
-    insLang.run("Java", "coffee", "Popular object-oriented enterprise language.", "Intermediate");
+    await dbRun("INSERT INTO languages(name,icon,description,difficulty) VALUES(?,?,?,?)", ["Python", "snake", "Clean, highly readable code.", "Beginner"]);
+    await dbRun("INSERT INTO languages(name,icon,description,difficulty) VALUES(?,?,?,?)", ["JavaScript", "code-js", "The language of the web.", "Beginner"]);
+    await dbRun("INSERT INTO languages(name,icon,description,difficulty) VALUES(?,?,?,?)", ["C++", "cpu", "Fast, high-performance language.", "Intermediate"]);
+    await dbRun("INSERT INTO languages(name,icon,description,difficulty) VALUES(?,?,?,?)", ["Java", "coffee", "Popular object-oriented enterprise language.", "Intermediate"]);
 
-    const pyLang = (db.prepare("SELECT id FROM languages WHERE name='Python'").get() as any).id;
-    const jsLang = (db.prepare("SELECT id FROM languages WHERE name='JavaScript'").get() as any).id;
-    const cppLang = (db.prepare("SELECT id FROM languages WHERE name='C++'").get() as any).id;
-    const javaLang = (db.prepare("SELECT id FROM languages WHERE name='Java'").get() as any).id;
+    const pyLang = (await dbGet("SELECT id FROM languages WHERE name='Python'")).id;
+    const jsLang = (await dbGet("SELECT id FROM languages WHERE name='JavaScript'")).id;
+    const cppLang = (await dbGet("SELECT id FROM languages WHERE name='C++'")).id;
+    const javaLang = (await dbGet("SELECT id FROM languages WHERE name='Java'")).id;
 
-    // Seed Student Language Belts
-    const insLangBelt = db.prepare("INSERT INTO student_language_belts(user_id,language_id,current_belt_id) VALUES(?,?,?)");
-    insLangBelt.run(sId, pyLang, 1);
-    insLangBelt.run(sId, cppLang, 1);
-    insLangBelt.run(sId, jsLang, 1);
-    insLangBelt.run(sId, javaLang, 1);
+    await dbRun("INSERT INTO student_language_belts(user_id,language_id,current_belt_id) VALUES(?,?,1)", [sId, pyLang]);
+    await dbRun("INSERT INTO student_language_belts(user_id,language_id,current_belt_id) VALUES(?,?,1)", [sId, cppLang]);
+    await dbRun("INSERT INTO student_language_belts(user_id,language_id,current_belt_id) VALUES(?,?,1)", [sId, jsLang]);
+    await dbRun("INSERT INTO student_language_belts(user_id,language_id,current_belt_id) VALUES(?,?,1)", [sId, javaLang]);
 
-    db.prepare("INSERT INTO belt_achievements(user_id,language_id,belt_id) VALUES(?,?,1)").run(sId, pyLang);
+    await dbRun("INSERT INTO belt_achievements(user_id,language_id,belt_id) VALUES(?,?,1)", [sId, pyLang]);
 
-    // Seed Achievements
-    const insAch = db.prepare("INSERT INTO achievements(code,title,description,icon,xp_bonus) VALUES(?,?,?,?,?)");
-    insAch.run("FIRST_STEP", "First Question Solved", "Pass all test cases on your first challenge.", "trophy", 25);
-    insAch.run("STREAK_7", "7 Day Streak", "Maintain a 7-day coding practice streak.", "fire", 50);
-    insAch.run("YELLOW_BELT", "Yellow Belt Earned", "Promoted to Yellow Belt status in Coding Dojo.", "award", 100);
+    await dbRun("INSERT INTO achievements(code,title,description,icon,xp_bonus) VALUES(?,?,?,?,?)", ["FIRST_STEP", "First Question Solved", "Pass all test cases on your first challenge.", "trophy", 25]);
+    await dbRun("INSERT INTO achievements(code,title,description,icon,xp_bonus) VALUES(?,?,?,?,?)", ["STREAK_7", "7 Day Streak", "Maintain a 7-day coding practice streak.", "fire", 50]);
+    await dbRun("INSERT INTO achievements(code,title,description,icon,xp_bonus) VALUES(?,?,?,?,?)", ["YELLOW_BELT", "Yellow Belt Earned", "Promoted to Yellow Belt status in Coding Dojo.", "award", 100]);
 
-    db.prepare("INSERT INTO student_achievements(user_id,achievement_id) VALUES(?,?)").run(sId, 1);
-
-    const insTopic = db.prepare("INSERT INTO topics(language_id,belt_id,name,description,content,line_explanation,common_mistakes,key_takeaways,estimated_minutes,sort_order) VALUES(?,?,?,?,?,?,?,?,?,?)");
-    const insQ = db.prepare("INSERT INTO questions(topic_id,title,statement,input_desc,output_desc,constraints,example_input,example_output,explanation,starter_code_py,starter_code_js,starter_code_cpp,starter_code_java,difficulty,xp_value,required,is_belt_test,hint_1,hint_2) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
-    const insTest = db.prepare("INSERT INTO test_cases(question_id,input,expected_output,visible) VALUES(?,?,?,?)");
+    await dbRun("INSERT INTO student_achievements(user_id,achievement_id) VALUES(?,1)", [sId]);
 
     const pyStarter = `import sys
 lines = sys.stdin.read().split()
@@ -350,55 +392,74 @@ int main() {
     ];
 
     for (const l of allLangs) {
-      // BELT 1 (WHITE BELT): Variables & Input
-      const t1 = Number(insTopic.run(l.id, 1, `[White Belt] ${l.name} Variables & Input`, `Learn variables and console input in ${l.name}.`, `# ${l.name} Variables & Input\n\nVariables store values in memory. Read input and print expected output.`, `1. Read input.\n2. Calculate.\n3. Output result.`, `• Type casting errors.`, `1. Variables store state.`, 10, 1).lastInsertRowid);
-      const q1 = Number(insQ.run(t1, `Sum of Two Numbers (${l.name})`, "Read two integers A and B and print their sum.", "Two space-separated integers A and B.", "A + B.", "-1000 <= A, B <= 1000", "5 10", "15", "5 + 10 = 15", pyStarter, jsStarter, cppStarter, "", "Easy", 50, 1, 1, "Read A and B", "Print sum").lastInsertRowid);
-      for (const [i,o,v] of [["5 10","15",1],["20 30","50",1],["100 250","350",1],["-5 8","3",0],["0 0","0",0],["7 -2","5",0],["500 500","1000",0],["-100 -200","-300",0]]) insTest.run(q1, i, o, v);
+      const t1Res = await dbRun("INSERT INTO topics(language_id,belt_id,name,description,content,line_explanation,common_mistakes,key_takeaways,estimated_minutes,sort_order) VALUES(?,?,?,?,?,?,?,?,?,?)", [l.id, 1, `[White Belt] ${l.name} Variables & Input`, `Learn variables and console input in ${l.name}.`, `# ${l.name} Variables & Input\n\nVariables store values in memory. Read input and print expected output.`, `1. Read input.\n2. Calculate.\n3. Output result.`, `• Type casting errors.`, `1. Variables store state.`, 10, 1]);
+      const t1 = t1Res.lastInsertRowid;
 
-      const q2 = Number(insQ.run(t1, `Multiply Three Numbers (${l.name})`, "Read three integers A, B, and C and print their product.", "Three space-separated integers A, B, C.", "Product A * B * C.", "-100 <= A, B, C <= 100", "2 3 4", "24", "2 * 3 * 4 = 24", "", "", cppStarter, "", "Easy", 50, 1, 0, "Read 3 numbers", "Multiply").lastInsertRowid);
-      for (const [i,o,v] of [["2 3 4","24",1],["5 0 10","0",1],["-2 4 5","-40",1],["1 1 1","1",0],["-3 -3 -3","-27",0],["10 20 30","6000",0],["7 8 2","112",0],["-5 2 -4","40",0]]) insTest.run(q2, i, o, v);
+      const q1Res = await dbRun("INSERT INTO questions(topic_id,title,statement,input_desc,output_desc,constraints,example_input,example_output,explanation,starter_code_py,starter_code_js,starter_code_cpp,starter_code_java,difficulty,xp_value,required,is_belt_test,hint_1,hint_2) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", [t1, `Sum of Two Numbers (${l.name})`, "Read two integers A and B and print their sum.", "Two space-separated integers A and B.", "A + B.", "-1000 <= A, B <= 1000", "5 10", "15", "5 + 10 = 15", pyStarter, jsStarter, cppStarter, "", "Easy", 50, 1, 1, "Read A and B", "Print sum"]);
+      const q1 = q1Res.lastInsertRowid;
+      for (const [i,o,v] of [["5 10","15",1],["20 30","50",1],["100 250","350",1],["-5 8","3",0],["0 0","0",0],["7 -2","5",0],["500 500","1000",0],["-100 -200","-300",0]]) {
+        await dbRun("INSERT INTO test_cases(question_id,input,expected_output,visible) VALUES(?,?,?,?)", [q1, i, o, v]);
+      }
 
-      const q3 = Number(insQ.run(t1, `Square of N (${l.name})`, "Read a single integer N and print N squared.", "Single integer N.", "N * N.", "-1000 <= N <= 1000", "7", "49", "7 squared is 49", "", "", cppStarter, "", "Easy", 50, 1, 0, "Read N", "Compute N * N").lastInsertRowid);
-      for (const [i,o,v] of [["7","49",1],["0","0",1],["-5","25",1],["12","144",0],["100","10000",0],["-15","225",0],["1","1",0],["9","81",0]]) insTest.run(q3, i, o, v);
+      const q2Res = await dbRun("INSERT INTO questions(topic_id,title,statement,input_desc,output_desc,constraints,example_input,example_output,explanation,starter_code_py,starter_code_js,starter_code_cpp,starter_code_java,difficulty,xp_value,required,is_belt_test,hint_1,hint_2) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", [t1, `Multiply Three Numbers (${l.name})`, "Read three integers A, B, and C and print their product.", "Three space-separated integers A, B, C.", "Product A * B * C.", "-100 <= A, B, C <= 100", "2 3 4", "24", "2 * 3 * 4 = 24", "", "", cppStarter, "", "Easy", 50, 1, 0, "Read 3 numbers", "Multiply"]);
+      const q2 = q2Res.lastInsertRowid;
+      for (const [i,o,v] of [["2 3 4","24",1],["5 0 10","0",1],["-2 4 5","-40",1],["1 1 1","1",0],["-3 -3 -3","-27",0],["10 20 30","6000",0],["7 8 2","112",0],["-5 2 -4","40",0]]) {
+        await dbRun("INSERT INTO test_cases(question_id,input,expected_output,visible) VALUES(?,?,?,?)", [q2, i, o, v]);
+      }
 
-      // BELT 1 (WHITE BELT): Basic Expressions
-      const t1b = Number(insTopic.run(l.id, 1, `[White Belt] ${l.name} Basic Expressions`, `Master math expressions in ${l.name}.`, `# ${l.name} Expressions\n\nEvaluate mathematical expressions with precedence.`, `1. Evaluate operators.\n2. Compute result.`, `• Division by zero.`, `1. Order of operations.`, 10, 2).lastInsertRowid);
-      const q1b = Number(insQ.run(t1b, `Perimeter of Rectangle (${l.name})`, "Read length L and width W, print 2*(L+W).", "Two integers L and W.", "Perimeter integer.", "1 <= L, W <= 1000", "5 10", "30", "2*(5+10)=30", "", "", cppStarter, "", "Easy", 50, 1, 0, "2 * (L + W)", "Print result").lastInsertRowid);
-      for (const [i,o,v] of [["5 10","30",1],["1 1","4",1],["10 20","60",1],["50 50","200",0],["100 200","600",0],["7 3","20",0],["12 8","40",0],["15 15","60",0]]) insTest.run(q1b, i, o, v);
+      const q3Res = await dbRun("INSERT INTO questions(topic_id,title,statement,input_desc,output_desc,constraints,example_input,example_output,explanation,starter_code_py,starter_code_js,starter_code_cpp,starter_code_java,difficulty,xp_value,required,is_belt_test,hint_1,hint_2) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", [t1, `Square of N (${l.name})`, "Read a single integer N and print N squared.", "Single integer N.", "N * N.", "-1000 <= N <= 1000", "7", "49", "7 squared is 49", "", "", cppStarter, "", "Easy", 50, 1, 0, "Read N", "Compute N * N"]);
+      const q3 = q3Res.lastInsertRowid;
+      for (const [i,o,v] of [["7","49",1],["0","0",1],["-5","25",1],["12","144",0],["100","10000",0],["-15","225",0],["1","1",0],["9","81",0]]) {
+        await dbRun("INSERT INTO test_cases(question_id,input,expected_output,visible) VALUES(?,?,?,?)", [q3, i, o, v]);
+      }
 
-      // BELT 1 (WHITE BELT): Formatting Output
-      const t1c = Number(insTopic.run(l.id, 1, `[White Belt] ${l.name} Formatting Output`, `Format text and values cleanly in ${l.name}.`, `# ${l.name} Formatting\n\nFormat console output string layout.`, `1. Read name.\n2. Output welcome text.`, `• Extra spaces.`, `1. Match string format.`, 10, 3).lastInsertRowid);
-      const q1c = Number(insQ.run(t1c, `Double Value (${l.name})`, "Read integer N and print N*2.", "Single integer N.", "N * 2.", "-1000 <= N <= 1000", "8", "16", "8 * 2 = 16", "", "", cppStarter, "", "Easy", 50, 1, 0, "N * 2", "Print double").lastInsertRowid);
-      for (const [i,o,v] of [["8","16",1],["0","0",1],["-4","-8",1],["100","200",0],["50","100",0],["-15","-30",0],["7","14",0],["99","198",0]]) insTest.run(q1c, i, o, v);
+      const t1bRes = await dbRun("INSERT INTO topics(language_id,belt_id,name,description,content,line_explanation,common_mistakes,key_takeaways,estimated_minutes,sort_order) VALUES(?,?,?,?,?,?,?,?,?,?)", [l.id, 1, `[White Belt] ${l.name} Basic Expressions`, `Master math expressions in ${l.name}.`, `# ${l.name} Expressions\n\nEvaluate mathematical expressions with precedence.`, `1. Evaluate operators.\n2. Compute result.`, `• Division by zero.`, `1. Order of operations.`, 10, 2]);
+      const t1b = t1bRes.lastInsertRowid;
+      const q1bRes = await dbRun("INSERT INTO questions(topic_id,title,statement,input_desc,output_desc,constraints,example_input,example_output,explanation,starter_code_py,starter_code_js,starter_code_cpp,starter_code_java,difficulty,xp_value,required,is_belt_test,hint_1,hint_2) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", [t1b, `Perimeter of Rectangle (${l.name})`, "Read length L and width W, print 2*(L+W).", "Two integers L and W.", "Perimeter integer.", "1 <= L, W <= 1000", "5 10", "30", "2*(5+10)=30", "", "", cppStarter, "", "Easy", 50, 1, 0, "2 * (L + W)", "Print result"]);
+      const q1b = q1bRes.lastInsertRowid;
+      for (const [i,o,v] of [["5 10","30",1],["1 1","4",1],["10 20","60",1],["50 50","200",0],["100 200","600",0],["7 3","20",0],["12 8","40",0],["15 15","60",0]]) {
+        await dbRun("INSERT INTO test_cases(question_id,input,expected_output,visible) VALUES(?,?,?,?)", [q1b, i, o, v]);
+      }
 
-      // BELT 2 (YELLOW BELT): Conditional Logic
-      const t2 = Number(insTopic.run(l.id, 2, `[Yellow Belt] ${l.name} Conditional Logic`, `Master logic conditions in ${l.name}.`, `# ${l.name} Conditions\n\nBranch logic using if/else statements.`, `1. Evaluate expression.\n2. Branch code logic.`, `• Single = instead of ==.`, `1. If-else controls flow.`, 12, 4).lastInsertRowid);
-      const q4 = Number(insQ.run(t2, `Even or Odd (${l.name})`, "Read integer N and print 'Even' if divisible by 2, else 'Odd'.", "Single integer N.", "'Even' or 'Odd'.", "-10000 <= N <= 10000", "4", "Even", "4 is divisible by 2", "", "", cppStarter, "", "Easy", 50, 1, 1, "Modulo % 2", "Print Even/Odd").lastInsertRowid);
-      for (const [i,o,v] of [["4","Even",1],["7","Odd",1],["0","Even",1],["-3","Odd",0],["100","Even",0],["101","Odd",0],["-44","Even",0],["999","Odd",0]]) insTest.run(q4, i, o, v);
+      const t1cRes = await dbRun("INSERT INTO topics(language_id,belt_id,name,description,content,line_explanation,common_mistakes,key_takeaways,estimated_minutes,sort_order) VALUES(?,?,?,?,?,?,?,?,?,?)", [l.id, 1, `[White Belt] ${l.name} Formatting Output`, `Format text and values cleanly in ${l.name}.`, `# ${l.name} Formatting\n\nFormat console output string layout.`, `1. Read name.\n2. Output welcome text.`, `• Extra spaces.`, `1. Match string format.`, 10, 3]);
+      const t1c = t1cRes.lastInsertRowid;
+      const q1cRes = await dbRun("INSERT INTO questions(topic_id,title,statement,input_desc,output_desc,constraints,example_input,example_output,explanation,starter_code_py,starter_code_js,starter_code_cpp,starter_code_java,difficulty,xp_value,required,is_belt_test,hint_1,hint_2) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", [t1c, `Double Value (${l.name})`, "Read integer N and print N*2.", "Single integer N.", "N * 2.", "-1000 <= N <= 1000", "8", "16", "8 * 2 = 16", "", "", cppStarter, "", "Easy", 50, 1, 0, "N * 2", "Print double"]);
+      const q1c = q1cRes.lastInsertRowid;
+      for (const [i,o,v] of [["8","16",1],["0","0",1],["-4","-8",1],["100","200",0],["50","100",0],["-15","-30",0],["7","14",0],["99","198",0]]) {
+        await dbRun("INSERT INTO test_cases(question_id,input,expected_output,visible) VALUES(?,?,?,?)", [q1c, i, o, v]);
+      }
 
-      const q5 = Number(insQ.run(t2, `Maximum of Two (${l.name})`, "Read two integers A and B and print the larger value.", "Two integers A and B.", "Larger integer.", "-1000 <= A, B <= 1000", "15 42", "42", "42 > 15", "", "", cppStarter, "", "Easy", 50, 1, 0, "Compare A, B", "Print larger").lastInsertRowid);
-      for (const [i,o,v] of [["15 42","42",1],["100 20","100",1],["-5 -10","-5",1],["0 0","0",0],["7 7","7",0],["-20 50","50",0],["99 100","100",0],["-1 -2","-1",0]]) insTest.run(q5, i, o, v);
+      const t2Res = await dbRun("INSERT INTO topics(language_id,belt_id,name,description,content,line_explanation,common_mistakes,key_takeaways,estimated_minutes,sort_order) VALUES(?,?,?,?,?,?,?,?,?,?)", [l.id, 2, `[Yellow Belt] ${l.name} Conditional Logic`, `Master logic conditions in ${l.name}.`, `# ${l.name} Conditions\n\nBranch logic using if/else statements.`, `1. Evaluate expression.\n2. Branch code logic.`, `• Single = instead of ==.`, `1. If-else controls flow.`, 12, 4]);
+      const t2 = t2Res.lastInsertRowid;
+      const q4Res = await dbRun("INSERT INTO questions(topic_id,title,statement,input_desc,output_desc,constraints,example_input,example_output,explanation,starter_code_py,starter_code_js,starter_code_cpp,starter_code_java,difficulty,xp_value,required,is_belt_test,hint_1,hint_2) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", [t2, `Even or Odd (${l.name})`, "Read integer N and print 'Even' if divisible by 2, else 'Odd'.", "Single integer N.", "'Even' or 'Odd'.", "-10000 <= N <= 10000", "4", "Even", "4 is divisible by 2", "", "", cppStarter, "", "Easy", 50, 1, 1, "Modulo % 2", "Print Even/Odd"]);
+      const q4 = q4Res.lastInsertRowid;
+      for (const [i,o,v] of [["4","Even",1],["7","Odd",1],["0","Even",1],["-3","Odd",0],["100","Even",0],["101","Odd",0],["-44","Even",0],["999","Odd",0]]) {
+        await dbRun("INSERT INTO test_cases(question_id,input,expected_output,visible) VALUES(?,?,?,?)", [q4, i, o, v]);
+      }
 
-      // BELT 3 (ORANGE BELT): Loops & Iteration
-      const t3 = Number(insTopic.run(l.id, 3, `[Orange Belt] ${l.name} Loops & Iteration`, `Repeat tasks with loops in ${l.name}.`, `# ${l.name} Loops\n\nLoops iterate over ranges automatically.`, `1. Counter setup.\n2. Exit check.`, `• Infinite loops.`, `1. For loops repeat iterations.`, 15, 5).lastInsertRowid);
-      const q7 = Number(insQ.run(t3, `Print 1 to N (${l.name})`, "Read integer N and print numbers from 1 to N space-separated.", "Single positive integer N.", "1 to N space-separated.", "1 <= N <= 100", "5", "1 2 3 4 5", "Prints 1 2 3 4 5", "", "", cppStarter, "", "Easy", 50, 1, 1, "Loop 1 to N", "Space-separated").lastInsertRowid);
-      for (const [i,o,v] of [["5","1 2 3 4 5",1],["1","1",1],["3","1 2 3",1],["6","1 2 3 4 5 6",0],["8","1 2 3 4 5 6 7 8",0],["10","1 2 3 4 5 6 7 8 9 10",0],["2","1 2",0],["4","1 2 3 4",0]]) insTest.run(q7, i, o, v);
+      const t3Res = await dbRun("INSERT INTO topics(language_id,belt_id,name,description,content,line_explanation,common_mistakes,key_takeaways,estimated_minutes,sort_order) VALUES(?,?,?,?,?,?,?,?,?,?)", [l.id, 3, `[Orange Belt] ${l.name} Loops & Iteration`, `Repeat tasks with loops in ${l.name}.`, `# ${l.name} Loops\n\nLoops iterate over ranges automatically.`, `1. Counter setup.\n2. Exit check.`, `• Infinite loops.`, `1. For loops repeat iterations.`, 15, 5]);
+      const t3 = t3Res.lastInsertRowid;
+      const q7Res = await dbRun("INSERT INTO questions(topic_id,title,statement,input_desc,output_desc,constraints,example_input,example_output,explanation,starter_code_py,starter_code_js,starter_code_cpp,starter_code_java,difficulty,xp_value,required,is_belt_test,hint_1,hint_2) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", [t3, `Print 1 to N (${l.name})`, "Read integer N and print numbers from 1 to N space-separated.", "Single positive integer N.", "1 to N space-separated.", "1 <= N <= 100", "5", "1 2 3 4 5", "Prints 1 2 3 4 5", "", "", cppStarter, "", "Easy", 50, 1, 1, "Loop 1 to N", "Space-separated"]);
+      const q7 = q7Res.lastInsertRowid;
+      for (const [i,o,v] of [["5","1 2 3 4 5",1],["1","1",1],["3","1 2 3",1],["6","1 2 3 4 5 6",0],["8","1 2 3 4 5 6 7 8",0],["10","1 2 3 4 5 6 7 8 9 10",0],["2","1 2",0],["4","1 2 3 4",0]]) {
+        await dbRun("INSERT INTO test_cases(question_id,input,expected_output,visible) VALUES(?,?,?,?)", [q7, i, o, v]);
+      }
 
       if (l.name === "Python") {
-        db.prepare("INSERT INTO question_progress(user_id,question_id,solved,attempts,solved_at) VALUES(?,?,1,1,CURRENT_TIMESTAMP)").run(sId, q1);
-        db.prepare("INSERT INTO question_progress(user_id,question_id,solved,attempts,solved_at) VALUES(?,?,1,1,CURRENT_TIMESTAMP)").run(sId, q1b);
-        db.prepare("INSERT INTO question_progress(user_id,question_id,solved,attempts,solved_at) VALUES(?,?,1,1,CURRENT_TIMESTAMP)").run(sId, q1c);
-        db.prepare("INSERT INTO content_progress(user_id,topic_id,completed_at) VALUES(?,?,CURRENT_TIMESTAMP)").run(sId, t1);
-        db.prepare("INSERT INTO content_progress(user_id,topic_id,completed_at) VALUES(?,?,CURRENT_TIMESTAMP)").run(sId, t1b);
-        db.prepare("INSERT INTO content_progress(user_id,topic_id,completed_at) VALUES(?,?,CURRENT_TIMESTAMP)").run(sId, t1c);
+        await dbRun("INSERT INTO question_progress(user_id,question_id,solved,attempts,solved_at) VALUES(?,?,1,1,CURRENT_TIMESTAMP)", [sId, q1]);
+        await dbRun("INSERT INTO question_progress(user_id,question_id,solved,attempts,solved_at) VALUES(?,?,1,1,CURRENT_TIMESTAMP)", [sId, q1b]);
+        await dbRun("INSERT INTO question_progress(user_id,question_id,solved,attempts,solved_at) VALUES(?,?,1,1,CURRENT_TIMESTAMP)", [sId, q1c]);
+        await dbRun("INSERT INTO content_progress(user_id,topic_id,completed_at) VALUES(?,? ,CURRENT_TIMESTAMP)", [sId, t1]);
+        await dbRun("INSERT INTO content_progress(user_id,topic_id,completed_at) VALUES(?,? ,CURRENT_TIMESTAMP)", [sId, t1b]);
+        await dbRun("INSERT INTO content_progress(user_id,topic_id,completed_at) VALUES(?,? ,CURRENT_TIMESTAMP)", [sId, t1c]);
       }
     }
 
-    db.prepare("INSERT INTO staff_notes(student_id,staff_id,note) VALUES(?,?,?)").run(sId, stId, "Student Arun completed 3 topics in Python and is ready for Yellow Belt Promotion Test.");
+    await dbRun("INSERT INTO staff_notes(student_id,staff_id,note) VALUES(?,?,?)", [sId, stId, "Student Arun completed 3 topics in Python and is ready for Yellow Belt Promotion Test."]);
     console.log("Database seeded successfully!");
   }
 }
-seedDatabase();
+seedDatabase().catch((err) => console.error("Database seed error:", err));
 
 type AuthReq = express.Request & { user?: any };
 
@@ -424,16 +485,16 @@ function requireRole(...allowedRoles: string[]) {
   };
 }
 
-function logActivity(userId: number, action: string, meta: any = "") {
+async function logActivity(userId: number, action: string, meta: any = "") {
   try {
-    db.prepare("INSERT INTO activity_logs(user_id,action,meta) VALUES(?,?,?)").run(userId, action, JSON.stringify(meta));
+    await dbRun("INSERT INTO activity_logs(user_id,action,meta) VALUES(?,?,?)", [userId, action, JSON.stringify(meta)]);
   } catch (err) {
     console.error("Activity log error:", err);
   }
 }
 
-function addStudentXP(userId: number, xpAmount: number) {
-  const profile = db.prepare("SELECT * FROM student_profiles WHERE user_id=?").get(userId) as any;
+async function addStudentXP(userId: number, xpAmount: number) {
+  const profile: any = await dbGet("SELECT * FROM student_profiles WHERE user_id=?", [userId]);
   if (!profile) return;
 
   const today = new Date().toISOString().split('T')[0];
@@ -451,7 +512,7 @@ function addStudentXP(userId: number, xpAmount: number) {
   }
 
   const newXP = profile.xp + xpAmount;
-  db.prepare("UPDATE student_profiles SET xp=?, streak_days=?, last_active_date=? WHERE user_id=?").run(newXP, newStreak, today, userId);
+  await dbRun("UPDATE student_profiles SET xp=?, streak_days=?, last_active_date=? WHERE user_id=?", [newXP, newStreak, today, userId]);
 }
 
 function normalizeOutput(str: string): string {
@@ -491,8 +552,8 @@ function execProcess(command: string, args: string[], input: string, timeoutMs: 
   });
 }
 
-// ROBUST RUNNER FOR PYTHON, JS, C++, JAVA WITH FALLBACKS
-async function runStudentCode(language: string, code: string, input: string, timeoutMs: number = 3000) {
+// LOCAL PROCESS FALLBACK RUNNER
+async function runLocalStudentCode(language: string, code: string, input: string, timeoutMs: number = 3000) {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "dojo-run-"));
   let cmd = "", args: string[] = [], filePath = "";
 
@@ -552,46 +613,116 @@ async function runStudentCode(language: string, code: string, input: string, tim
   }
 }
 
-// AUTH
-app.post("/api/register", (req, res) => {
-  const { name, email, password, language } = req.body || {};
-  if (!name || !email || !password) return res.status(400).json({ error: "Name, email, and password required" });
+// PRODUCTION CODE EXECUTION ARCHITECTURE: JUDGE0 API + LOCAL FALLBACK
+async function runStudentCode(language: string, code: string, input: string, timeoutMs: number = 3000) {
+  const judge0Url = process.env.EXECUTION_API_URL || process.env.JUDGE0_API_URL || "https://ce.judge0.com";
+  const judge0Key = process.env.EXECUTION_API_KEY || process.env.JUDGE0_API_KEY || "";
 
-  const existing = db.prepare("SELECT id FROM users WHERE lower(email)=lower(?)").get(email);
-  if (existing) return res.status(400).json({ error: "Email is already registered" });
+  const langIdMap: Record<string, number> = {
+    Python: 71,
+    JavaScript: 63,
+    "C++": 54,
+    Java: 62
+  };
 
-  const hash = bcrypt.hashSync(password, 10);
-  const result = db.prepare("INSERT INTO users(name,email,password_hash,role,selected_language) VALUES(?,?,?,'student',?)").run(name, email, hash, language || "Python");
-  const userId = Number(result.lastInsertRowid);
+  const langId = langIdMap[language] || 71;
 
-  const today = new Date().toISOString().split('T')[0];
-  db.prepare("INSERT INTO student_profiles(user_id,xp,streak_days,last_active_date) VALUES(?,0,1,?)").run(userId, today);
-  
-  const langs = db.prepare("SELECT id FROM languages").all() as any[];
-  for (const l of langs) {
-    db.prepare("INSERT INTO student_language_belts(user_id,language_id,current_belt_id) VALUES(?,?,1)").run(userId, l.id);
-    db.prepare("INSERT INTO belt_achievements(user_id,language_id,belt_id) VALUES(?,?,1)").run(userId, l.id);
+  if (judge0Url) {
+    try {
+      const url = `${judge0Url.replace(/\/$/, "")}/submissions?wait=true&base64_encoded=false`;
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json"
+      };
+      if (judge0Key) {
+        headers["X-RapidAPI-Key"] = judge0Key;
+        headers["X-RapidAPI-Host"] = new URL(judge0Url).hostname;
+        headers["X-Auth-Token"] = judge0Key;
+      }
+
+      const body = {
+        source_code: code || "",
+        language_id: langId,
+        stdin: input || "",
+        cpu_time_limit: Math.ceil(timeoutMs / 1000)
+      };
+
+      const resp = await fetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body)
+      });
+
+      if (resp.ok) {
+        const data = await resp.json();
+        const stdout = data.stdout || "";
+        const stderr = data.stderr || data.compile_output || "";
+        const statusDescription = data.status?.description || "";
+
+        const isSuccess = data.status?.id === 3;
+        const outText = stdout || stderr || statusDescription;
+
+        return {
+          passed: isSuccess,
+          error: stderr || (isSuccess ? "" : statusDescription),
+          output: outText
+        };
+      }
+    } catch (err: any) {
+      console.warn("Judge0 sandbox execution failed, attempting local fallback if available:", err.message);
+    }
   }
 
-  const token = jwt.sign({ id: userId, name, email, role: "student" }, JWT_SECRET, { expiresIn: "7d" });
-  res.cookie("token", token, { httpOnly: true, sameSite: "lax" });
+  return runLocalStudentCode(language, code, input, timeoutMs);
+}
 
-  logActivity(userId, "register");
-  res.json({ user: { id: userId, name, email, role: "student", selected_language: language || "Python" } });
+// AUTH
+app.post("/api/register", async (req, res) => {
+  try {
+    const { name, email, password, language } = req.body || {};
+    if (!name || !email || !password) return res.status(400).json({ error: "Name, email, and password required" });
+
+    const existing = await dbGet("SELECT id FROM users WHERE lower(email)=lower(?)", [email]);
+    if (existing) return res.status(400).json({ error: "Email is already registered" });
+
+    const hash = bcrypt.hashSync(password, 10);
+    const result = await dbRun("INSERT INTO users(name,email,password_hash,role,selected_language) VALUES(?,?,?,'student',?)", [name, email, hash, language || "Python"]);
+    const userId = result.lastInsertRowid;
+
+    const today = new Date().toISOString().split('T')[0];
+    await dbRun("INSERT INTO student_profiles(user_id,xp,streak_days,last_active_date) VALUES(?,0,1,?)", [userId, today]);
+    
+    const langs = await dbAll("SELECT id FROM languages");
+    for (const l of langs) {
+      await dbRun("INSERT INTO student_language_belts(user_id,language_id,current_belt_id) VALUES(?,?,1)", [userId, l.id]);
+      await dbRun("INSERT INTO belt_achievements(user_id,language_id,belt_id) VALUES(?,?,1)", [userId, l.id]);
+    }
+
+    const token = jwt.sign({ id: userId, name, email, role: "student" }, JWT_SECRET, { expiresIn: "7d" });
+    res.cookie("token", token, { httpOnly: true, sameSite: "lax" });
+
+    await logActivity(userId, "register");
+    res.json({ user: { id: userId, name, email, role: "student", selected_language: language || "Python" } });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "Registration failed" });
+  }
 });
 
-app.post("/api/login", (req, res) => {
-  const { email, password } = req.body || {};
-  const u: any = db.prepare("SELECT * FROM users WHERE lower(email)=lower(?) AND active=1").get(email || "");
-  if (!u || !bcrypt.compareSync(password || "", u.password_hash)) {
-    return res.status(401).json({ error: "Invalid email or password" });
+app.post("/api/login", async (req, res) => {
+  try {
+    const { email, password } = req.body || {};
+    const u: any = await dbGet("SELECT * FROM users WHERE lower(email)=lower(?) AND active=1", [email || ""]);
+    if (!u || !bcrypt.compareSync(password || "", u.password_hash)) {
+      return res.status(401).json({ error: "Invalid email or password" });
+    }
+
+    const token = jwt.sign({ id: u.id, name: u.name, email: u.email, role: u.role }, JWT_SECRET, { expiresIn: "7d" });
+    res.cookie("token", token, { httpOnly: true, sameSite: "lax" });
+
+    await logActivity(u.id, "login");
+    res.json({ user: { id: u.id, name: u.name, email: u.email, role: u.role, selected_language: u.selected_language } });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "Login failed" });
   }
-
-  const token = jwt.sign({ id: u.id, name: u.name, email: u.email, role: u.role }, JWT_SECRET, { expiresIn: "7d" });
-  res.cookie("token", token, { httpOnly: true, sameSite: "lax" });
-
-  logActivity(u.id, "login");
-  res.json({ user: { id: u.id, name: u.name, email: u.email, role: u.role, selected_language: u.selected_language } });
 });
 
 app.post("/api/logout", (req, res) => {
@@ -599,767 +730,916 @@ app.post("/api/logout", (req, res) => {
   res.json({ ok: true });
 });
 
-app.get("/api/me", authMiddleware, (req: AuthReq, res) => {
-  const u: any = db.prepare("SELECT id, name, email, role, selected_language FROM users WHERE id=?").get(req.user.id);
-  if (!u) return res.status(404).json({ error: "User not found" });
+app.get("/api/me", authMiddleware, async (req: AuthReq, res) => {
+  try {
+    const u: any = await dbGet("SELECT id, name, email, role, selected_language FROM users WHERE id=?", [req.user.id]);
+    if (!u) return res.status(404).json({ error: "User not found" });
 
-  const profile: any = db.prepare("SELECT * FROM student_profiles WHERE user_id=?").get(u.id) || { xp: 0, streak_days: 0 };
-  res.json({ user: { ...u, profile } });
+    const profile: any = (await dbGet("SELECT * FROM student_profiles WHERE user_id=?", [u.id])) || { xp: 0, streak_days: 0 };
+    res.json({ user: { ...u, profile } });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.post("/api/onboarding", authMiddleware, (req: AuthReq, res) => {
-  const { language } = req.body || {};
-  if (language) {
-    db.prepare("UPDATE users SET selected_language=? WHERE id=?").run(language, req.user.id);
+app.post("/api/onboarding", authMiddleware, async (req: AuthReq, res) => {
+  try {
+    const { language } = req.body || {};
+    if (language) {
+      await dbRun("UPDATE users SET selected_language=? WHERE id=?", [language, req.user.id]);
+    }
+    res.json({ ok: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
   }
-  res.json({ ok: true });
 });
 
 // CURRICULUM
-app.get("/api/languages", (req, res) => {
-  res.json(db.prepare("SELECT * FROM languages WHERE enabled=1 ORDER BY id").all());
+app.get("/api/languages", async (req, res) => {
+  try {
+    res.json(await dbAll("SELECT * FROM languages WHERE enabled=1 ORDER BY id"));
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.get("/api/languages/:name/belt-details", authMiddleware, (req: AuthReq, res) => {
-  const uid = req.user.id;
-  const langName = String(req.params.name);
+app.get("/api/languages/:name/belt-details", authMiddleware, async (req: AuthReq, res) => {
+  try {
+    const uid = req.user.id;
+    const langName = String(req.params.name);
 
-  const lang: any = db.prepare("SELECT id, name FROM languages WHERE name=?").get(langName);
-  if (!lang) return res.status(404).json({ error: "Language not found" });
+    const lang: any = await dbGet("SELECT id, name FROM languages WHERE name=?", [langName]);
+    if (!lang) return res.status(404).json({ error: "Language not found" });
 
-  const slb: any = db.prepare("SELECT current_belt_id FROM student_language_belts WHERE user_id=? AND language_id=?").get(uid, lang.id) || { current_belt_id: 1 };
-  const currentBelt: any = db.prepare("SELECT * FROM belts WHERE id=?").get(slb.current_belt_id);
-  const nextBelt: any = db.prepare("SELECT * FROM belts WHERE sort_order > ? ORDER BY sort_order ASC LIMIT 1").get(currentBelt ? currentBelt.sort_order : 1);
+    const slb: any = (await dbGet("SELECT current_belt_id FROM student_language_belts WHERE user_id=? AND language_id=?", [uid, lang.id])) || { current_belt_id: 1 };
+    const currentBelt: any = await dbGet("SELECT * FROM belts WHERE id=?", [slb.current_belt_id]);
+    const nextBelt: any = await dbGet("SELECT * FROM belts WHERE sort_order > ? ORDER BY sort_order ASC LIMIT 1", [currentBelt ? currentBelt.sort_order : 1]);
 
-  const completedTopicsCount = (db.prepare(`
-    SELECT COUNT(DISTINCT cp.topic_id) c FROM content_progress cp
-    JOIN topics t ON t.id = cp.topic_id
-    WHERE cp.user_id=? AND t.language_id=? AND cp.completed_at IS NOT NULL
-  `).get(uid, lang.id) as any).c;
+    const completedTopicsCount = Number((await dbGet(`
+      SELECT COUNT(DISTINCT cp.topic_id) c FROM content_progress cp
+      JOIN topics t ON t.id = cp.topic_id
+      WHERE cp.user_id=? AND t.language_id=? AND cp.completed_at IS NOT NULL
+    `, [uid, lang.id]))?.c || 0);
 
-  const totalTopicsCount = (db.prepare("SELECT COUNT(*) c FROM topics WHERE language_id=? AND active=1").get(lang.id) as any).c;
-  const pendingReq: any = db.prepare("SELECT * FROM belt_promotion_requests WHERE user_id=? AND language_id=? ORDER BY id DESC LIMIT 1").get(uid, lang.id);
+    const totalTopicsCount = Number((await dbGet("SELECT COUNT(*) c FROM topics WHERE language_id=? AND active=1", [lang.id]))?.c || 0);
+    const pendingReq: any = await dbGet("SELECT * FROM belt_promotion_requests WHERE user_id=? AND language_id=? ORDER BY id DESC LIMIT 1", [uid, lang.id]);
 
-  res.json({
-    language: lang,
-    currentBelt,
-    nextBelt,
-    completedTopicsCount,
-    totalTopicsCount,
-    canApplyPromotion: completedTopicsCount >= 3,
-    promotionRequest: pendingReq
-  });
+    res.json({
+      language: lang,
+      currentBelt,
+      nextBelt,
+      completedTopicsCount,
+      totalTopicsCount,
+      canApplyPromotion: completedTopicsCount >= 3,
+      promotionRequest: pendingReq
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.get("/api/topics", authMiddleware, (req: AuthReq, res) => {
-  const langName = String(req.query.language || req.user.selected_language || "Python");
-  const topics = db.prepare(`
-    SELECT t.*, b.name belt_name, b.color_hex belt_color, l.name language_name,
-           CASE WHEN cp.completed_at IS NOT NULL THEN 1 ELSE 0 END completed,
-           (SELECT COUNT(*) FROM questions q WHERE q.topic_id = t.id AND q.active=1) question_count
-    FROM topics t
-    JOIN languages l ON l.id = t.language_id
-    JOIN belts b ON b.id = t.belt_id
-    LEFT JOIN content_progress cp ON cp.topic_id = t.id AND cp.user_id = ?
-    WHERE l.name = ? AND t.active = 1
-    ORDER BY b.sort_order ASC, t.sort_order ASC
-  `).all(req.user.id, langName);
+app.get("/api/topics", authMiddleware, async (req: AuthReq, res) => {
+  try {
+    const langName = String(req.query.language || req.user.selected_language || "Python");
+    const topics = await dbAll(`
+      SELECT t.*, b.name belt_name, b.color_hex belt_color, l.name language_name,
+             CASE WHEN cp.completed_at IS NOT NULL THEN 1 ELSE 0 END completed,
+             (SELECT COUNT(*) FROM questions q WHERE q.topic_id = t.id AND q.active=1) question_count
+      FROM topics t
+      JOIN languages l ON l.id = t.language_id
+      JOIN belts b ON b.id = t.belt_id
+      LEFT JOIN content_progress cp ON cp.topic_id = t.id AND cp.user_id = ?
+      WHERE l.name = ? AND t.active = 1
+      ORDER BY b.sort_order ASC, t.sort_order ASC
+    `, [req.user.id, langName]);
 
-  res.json(topics);
+    res.json(topics);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.get("/api/topics/:id", authMiddleware, (req: AuthReq, res) => {
-  const topic: any = db.prepare(`
-    SELECT t.*, l.name language_name, b.name belt_name, b.color_hex belt_color
-    FROM topics t
-    JOIN languages l ON l.id = t.language_id
-    JOIN belts b ON b.id = t.belt_id
-    WHERE t.id = ?
-  `).get(Number(req.params.id));
+app.get("/api/topics/:id", authMiddleware, async (req: AuthReq, res) => {
+  try {
+    const tId = Number(req.params.id);
+    const topic: any = await dbGet(`
+      SELECT t.*, l.name language_name, b.name belt_name, b.color_hex belt_color
+      FROM topics t
+      JOIN languages l ON l.id = t.language_id
+      JOIN belts b ON b.id = t.belt_id
+      WHERE t.id = ?
+    `, [tId]);
 
-  if (!topic) return res.status(404).json({ error: "Topic not found" });
+    if (!topic) return res.status(404).json({ error: "Topic not found" });
 
-  db.prepare("INSERT OR IGNORE INTO content_progress(user_id,topic_id) VALUES(?,?)").run(req.user.id, topic.id);
-  const questions = db.prepare(`
-    SELECT q.id, q.title, q.difficulty, q.xp_value, q.required,
-           COALESCE(qp.solved, 0) solved, COALESCE(qp.attempts, 0) attempts
-    FROM questions q
-    LEFT JOIN question_progress qp ON qp.question_id = q.id AND qp.user_id = ?
-    WHERE q.topic_id = ? AND q.active = 1
-    ORDER BY q.id ASC
-  `).all(req.user.id, topic.id);
+    await dbRun("INSERT INTO content_progress(user_id,topic_id) VALUES(?,?) ON CONFLICT DO NOTHING", [req.user.id, topic.id]);
+    const questions = await dbAll(`
+      SELECT q.id, q.title, q.difficulty, q.xp_value, q.required,
+             COALESCE(qp.solved, 0) solved, COALESCE(qp.attempts, 0) attempts
+      FROM questions q
+      LEFT JOIN question_progress qp ON qp.question_id = q.id AND qp.user_id = ?
+      WHERE q.topic_id = ? AND q.active = 1
+      ORDER BY q.id ASC
+    `, [req.user.id, topic.id]);
 
-  res.json({ ...topic, questions });
+    res.json({ ...topic, questions });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.post("/api/topics/:id/complete", authMiddleware, (req: AuthReq, res) => {
-  db.prepare("UPDATE content_progress SET completed_at=CURRENT_TIMESTAMP WHERE user_id=? AND topic_id=?").run(req.user.id, Number(req.params.id));
-  addStudentXP(req.user.id, 10);
-  logActivity(req.user.id, "topic_completed", { topicId: req.params.id });
-  res.json({ ok: true, xpEarned: 10 });
+app.post("/api/topics/:id/complete", authMiddleware, async (req: AuthReq, res) => {
+  try {
+    const tId = Number(req.params.id);
+    await dbRun("UPDATE content_progress SET completed_at=CURRENT_TIMESTAMP WHERE user_id=? AND topic_id=?", [req.user.id, tId]);
+    await addStudentXP(req.user.id, 10);
+    await logActivity(req.user.id, "topic_completed", { topicId: tId });
+    res.json({ ok: true, xpEarned: 10 });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // BELT PROMOTION EXAM & TEST CASE EVALUATION
-app.post("/api/belt-promotion/request", authMiddleware, (req: AuthReq, res) => {
-  const { language } = req.body || {};
-  const uid = req.user.id;
+app.post("/api/belt-promotion/request", authMiddleware, async (req: AuthReq, res) => {
+  try {
+    const { language } = req.body || {};
+    const uid = req.user.id;
 
-  const lang: any = db.prepare("SELECT id FROM languages WHERE name=?").get(language);
-  if (!lang) return res.status(400).json({ error: "Invalid language" });
+    const lang: any = await dbGet("SELECT id FROM languages WHERE name=?", [language]);
+    if (!lang) return res.status(400).json({ error: "Invalid language" });
 
-  const completedCount = (db.prepare(`
-    SELECT COUNT(DISTINCT cp.topic_id) c FROM content_progress cp
-    JOIN topics t ON t.id = cp.topic_id
-    WHERE cp.user_id=? AND t.language_id=? AND cp.completed_at IS NOT NULL
-  `).get(uid, lang.id) as any).c;
+    const completedCount = Number((await dbGet(`
+      SELECT COUNT(DISTINCT cp.topic_id) c FROM content_progress cp
+      JOIN topics t ON t.id = cp.topic_id
+      WHERE cp.user_id=? AND t.language_id=? AND cp.completed_at IS NOT NULL
+    `, [uid, lang.id]))?.c || 0);
 
-  if (completedCount < 3) {
-    return res.status(400).json({ error: "Minimum 3 completed topics required to apply for Belt Promotion." });
+    if (completedCount < 3) {
+      return res.status(400).json({ error: "Minimum 3 completed topics required to apply for Belt Promotion." });
+    }
+
+    const slb: any = (await dbGet("SELECT current_belt_id FROM student_language_belts WHERE user_id=? AND language_id=?", [uid, lang.id])) || { current_belt_id: 1 };
+    const nextBelt: any = await dbGet("SELECT id FROM belts WHERE sort_order > (SELECT sort_order FROM belts WHERE id=?) ORDER BY sort_order ASC LIMIT 1", [slb.current_belt_id]);
+
+    if (!nextBelt) return res.status(400).json({ error: "You are already at Black Belt rank!" });
+
+    await dbRun(`
+      INSERT INTO belt_promotion_requests(user_id, language_id, current_belt_id, target_belt_id, status)
+      VALUES(?, ?, ?, ?, 'pending')
+    `, [uid, lang.id, slb.current_belt_id, nextBelt.id]);
+
+    await logActivity(uid, "promotion_requested", { language, targetBeltId: nextBelt.id });
+    res.json({ ok: true, message: "Belt promotion request submitted to Sensei Staff for review!" });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
   }
-
-  const slb: any = db.prepare("SELECT current_belt_id FROM student_language_belts WHERE user_id=? AND language_id=?").get(uid, lang.id) || { current_belt_id: 1 };
-  const nextBelt: any = db.prepare("SELECT id FROM belts WHERE sort_order > (SELECT sort_order FROM belts WHERE id=?) ORDER BY sort_order ASC LIMIT 1").get(slb.current_belt_id);
-
-  if (!nextBelt) return res.status(400).json({ error: "You are already at Black Belt rank!" });
-
-  db.prepare(`
-    INSERT INTO belt_promotion_requests(user_id, language_id, current_belt_id, target_belt_id, status)
-    VALUES(?, ?, ?, ?, 'pending')
-  `).run(uid, lang.id, slb.current_belt_id, nextBelt.id);
-
-  logActivity(uid, "promotion_requested", { language, targetBeltId: nextBelt.id });
-  res.json({ ok: true, message: "Belt promotion request submitted to Sensei Staff for review!" });
 });
 
-app.get("/api/belt-test/exam", authMiddleware, (req: AuthReq, res) => {
-  const uid = req.user.id;
-  const langName = String(req.query.language || "Python");
+app.get("/api/belt-test/exam", authMiddleware, async (req: AuthReq, res) => {
+  try {
+    const uid = req.user.id;
+    const langName = String(req.query.language || "Python");
 
-  const lang: any = db.prepare("SELECT id, name FROM languages WHERE name=?").get(langName);
-  if (!lang) return res.status(404).json({ error: "Language not found" });
+    const lang: any = await dbGet("SELECT id, name FROM languages WHERE name=?", [langName]);
+    if (!lang) return res.status(404).json({ error: "Language not found" });
 
-  const bpr: any = db.prepare(`
-    SELECT bpr.*, tb.name target_belt_name, tb.color_hex target_belt_color
-    FROM belt_promotion_requests bpr
-    JOIN belts tb ON tb.id = bpr.target_belt_id
-    WHERE bpr.user_id=? AND bpr.language_id=? AND bpr.status='approved'
-    ORDER BY bpr.id DESC LIMIT 1
-  `).get(uid, lang.id);
+    const bpr: any = await dbGet(`
+      SELECT bpr.*, tb.name target_belt_name, tb.color_hex target_belt_color
+      FROM belt_promotion_requests bpr
+      JOIN belts tb ON tb.id = bpr.target_belt_id
+      WHERE bpr.user_id=? AND bpr.language_id=? AND bpr.status='approved'
+      ORDER BY bpr.id DESC LIMIT 1
+    `, [uid, lang.id]);
 
-  if (!bpr) return res.status(403).json({ error: "No approved belt promotion exam found." });
+    if (!bpr) return res.status(403).json({ error: "No approved belt promotion exam found." });
 
-  let examQuestions = db.prepare(`
-    SELECT q.id, q.title, q.statement, q.input_desc, q.output_desc, q.example_input, q.example_output, t.name topic_name
-    FROM questions q
-    JOIN topics t ON t.id = q.topic_id
-    WHERE t.language_id=? AND q.is_belt_test=1 AND q.active=1
-    LIMIT 3
-  `).all(lang.id) as any[];
+    let examQuestions = await dbAll(`
+      SELECT q.id, q.title, q.statement, q.input_desc, q.output_desc, q.example_input, q.example_output, t.name topic_name
+      FROM questions q
+      JOIN topics t ON t.id = q.topic_id
+      WHERE t.language_id=? AND q.is_belt_test=1 AND q.active=1
+      LIMIT 3
+    `, [lang.id]);
 
-  if (examQuestions.length < 3) {
-    const topics = db.prepare("SELECT id, name FROM topics WHERE language_id=? AND active=1 ORDER BY sort_order ASC LIMIT 3").all(lang.id) as any[];
-    examQuestions = [];
-    for (const t of topics) {
-      const q: any = db.prepare("SELECT id, title, statement, input_desc, output_desc, example_input, example_output FROM questions WHERE topic_id=? AND active=1 LIMIT 1").get(t.id);
-      if (q) {
-        examQuestions.push({ ...q, topic_name: t.name });
+    if (examQuestions.length < 3) {
+      const topics = await dbAll("SELECT id, name FROM topics WHERE language_id=? AND active=1 ORDER BY sort_order ASC LIMIT 3", [lang.id]);
+      examQuestions = [];
+      for (const t of topics) {
+        const q: any = await dbGet("SELECT id, title, statement, input_desc, output_desc, example_input, example_output FROM questions WHERE topic_id=? AND active=1 LIMIT 1", [t.id]);
+        if (q) {
+          examQuestions.push({ ...q, topic_name: t.name });
+        }
       }
     }
+
+    const enrichedQuestions = [];
+    for (const q of examQuestions) {
+      const visibleCases = await dbAll("SELECT id, input, expected_output FROM test_cases WHERE question_id=? AND visible=1", [q.id]);
+      const hiddenCount = Number((await dbGet("SELECT COUNT(*) c FROM test_cases WHERE question_id=? AND visible=0", [q.id]))?.c || 0);
+      enrichedQuestions.push({ ...q, visibleTestCases: visibleCases, hiddenTestCasesCount: hiddenCount });
+    }
+
+    res.json({ promotionRequest: bpr, language: lang, examQuestions: enrichedQuestions });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
   }
-
-  const enrichedQuestions = examQuestions.map(q => {
-    const visibleCases = db.prepare("SELECT id, input, expected_output FROM test_cases WHERE question_id=? AND visible=1").all(q.id);
-    const hiddenCount = (db.prepare("SELECT COUNT(*) c FROM test_cases WHERE question_id=? AND visible=0").get(q.id) as any).c;
-    return { ...q, visibleTestCases: visibleCases, hiddenTestCasesCount: hiddenCount };
-  });
-
-  res.json({ promotionRequest: bpr, language: lang, examQuestions: enrichedQuestions });
 });
 
 app.post("/api/belt-test/run-question", authMiddleware, async (req: AuthReq, res) => {
-  const { questionId, code, language } = req.body || {};
-  const qId = Number(questionId);
+  try {
+    const { questionId, code, language } = req.body || {};
+    const qId = Number(questionId);
 
-  const q: any = db.prepare("SELECT * FROM questions WHERE id=? AND active=1").get(qId);
-  if (!q) return res.status(404).json({ error: "Question not found" });
+    const q: any = await dbGet("SELECT * FROM questions WHERE id=? AND active=1", [qId]);
+    if (!q) return res.status(404).json({ error: "Question not found" });
 
-  const allTestCases = db.prepare("SELECT * FROM test_cases WHERE question_id=? ORDER BY visible DESC, id ASC").all(qId) as any[];
+    const allTestCases = await dbAll("SELECT * FROM test_cases WHERE question_id=? ORDER BY visible DESC, id ASC", [qId]);
 
-  const visibleResults = [];
-  let hiddenPassedCount = 0;
-  let hiddenTotalCount = 0;
-  let allPassed = true;
+    const visibleResults = [];
+    let hiddenPassedCount = 0;
+    let hiddenTotalCount = 0;
+    let allPassed = true;
 
-  for (const tc of allTestCases) {
-    const exec = await runStudentCode(language || "Python", code || "", tc.input, tc.timeout_ms || 3000);
-    const normalizedActual = normalizeOutput(exec.output);
-    const normalizedExpected = normalizeOutput(tc.expected_output);
-    const passed = exec.passed && normalizedActual === normalizedExpected;
+    for (const tc of allTestCases) {
+      const exec = await runStudentCode(language || "Python", code || "", tc.input, tc.timeout_ms || 3000);
+      const normalizedActual = normalizeOutput(exec.output);
+      const normalizedExpected = normalizeOutput(tc.expected_output);
+      const passed = exec.passed && normalizedActual === normalizedExpected;
 
-    if (!passed) allPassed = false;
+      if (!passed) allPassed = false;
 
-    if (tc.visible === 1) {
-      visibleResults.push({
-        testNumber: visibleResults.length + 1,
-        input: tc.input,
-        expectedOutput: tc.expected_output,
-        actualOutput: exec.output,
-        status: passed ? "passed" : exec.error || "failed"
-      });
-    } else {
-      hiddenTotalCount++;
-      if (passed) hiddenPassedCount++;
-    }
-  }
-
-  res.json({
-    visibleTests: visibleResults,
-    hiddenTests: {
-      passed: hiddenPassedCount,
-      total: hiddenTotalCount
-    },
-    allPassed
-  });
-});
-
-app.post("/api/belt-test/submit", authMiddleware, async (req: AuthReq, res) => {
-  const uid = req.user.id;
-  const { language, answers } = req.body || {};
-
-  const lang: any = db.prepare("SELECT id, name FROM languages WHERE name=?").get(language);
-  if (!lang) return res.status(400).json({ error: "Invalid language" });
-
-  const bpr: any = db.prepare("SELECT * FROM belt_promotion_requests WHERE user_id=? AND language_id=? AND status='approved' ORDER BY id DESC LIMIT 1").get(uid, lang.id);
-  if (!bpr) return res.status(403).json({ error: "No active approved promotion exam." });
-
-  let allQuestionsPassed = true;
-  const results = [];
-
-  for (const [qIdStr, codeStr] of Object.entries(answers || {})) {
-    const qId = Number(qIdStr);
-    const testCases = db.prepare("SELECT * FROM test_cases WHERE question_id=?").all(qId) as any[];
-    let qPassed = true;
-
-    for (const tc of testCases) {
-      const exec = await runStudentCode(lang.name, String(codeStr || ""), tc.input, tc.timeout_ms || 3000);
-      if (!exec.passed || normalizeOutput(exec.output) !== normalizeOutput(tc.expected_output)) {
-        qPassed = false;
-        break;
+      if (tc.visible === 1) {
+        visibleResults.push({
+          testNumber: visibleResults.length + 1,
+          input: tc.input,
+          expectedOutput: tc.expected_output,
+          actualOutput: exec.output,
+          status: passed ? "passed" : exec.error || "failed"
+        });
+      } else {
+        hiddenTotalCount++;
+        if (passed) hiddenPassedCount++;
       }
     }
 
-    if (!qPassed) allQuestionsPassed = false;
-    results.push({ questionId: qId, passed: qPassed });
+    res.json({
+      visibleTests: visibleResults,
+      hiddenTests: {
+        passed: hiddenPassedCount,
+        total: hiddenTotalCount
+      },
+      allPassed
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
   }
+});
 
-  if (allQuestionsPassed && results.length >= 3) {
-    db.prepare("UPDATE student_language_belts SET current_belt_id=? WHERE user_id=? AND language_id=?").run(bpr.target_belt_id, uid, lang.id);
-    db.prepare("UPDATE belt_promotion_requests SET status='completed' WHERE id=?").run(bpr.id);
-    db.prepare("INSERT INTO belt_achievements(user_id,language_id,belt_id) VALUES(?,?,?)").run(uid, lang.id, bpr.target_belt_id);
-    
-    addStudentXP(uid, 100);
+app.post("/api/belt-test/submit", authMiddleware, async (req: AuthReq, res) => {
+  try {
+    const uid = req.user.id;
+    const { language, answers } = req.body || {};
 
-    const newBelt: any = db.prepare("SELECT * FROM belts WHERE id=?").get(bpr.target_belt_id);
-    db.prepare("INSERT INTO notifications(user_id,title,message,type) VALUES(?,?,?,?)").run(
-      uid,
-      `🥋 BELT PROMOTION ACHIEVED!`,
-      `Congratulations! You passed all 3 exam questions and earned your ${newBelt.name} in ${lang.name}!`,
-      "belt"
-    );
+    const lang: any = await dbGet("SELECT id, name FROM languages WHERE name=?", [language]);
+    if (!lang) return res.status(400).json({ error: "Invalid language" });
 
-    logActivity(uid, "belt_promoted", { language: lang.name, beltId: bpr.target_belt_id });
-    return res.json({ success: true, message: `🎉 Promotion Achieved! You earned your ${newBelt.name} in ${lang.name}!`, belt: newBelt });
-  } else {
-    db.prepare("UPDATE belt_promotion_requests SET status='failed' WHERE id=?").run(bpr.id);
-    return res.json({ success: false, message: "Promotion exam not passed. Make sure to pass all test cases for all 3 questions. You can re-apply later!" });
+    const bpr: any = await dbGet("SELECT * FROM belt_promotion_requests WHERE user_id=? AND language_id=? AND status='approved' ORDER BY id DESC LIMIT 1", [uid, lang.id]);
+    if (!bpr) return res.status(403).json({ error: "No active approved promotion exam." });
+
+    let allQuestionsPassed = true;
+    const results = [];
+
+    for (const [qIdStr, codeStr] of Object.entries(answers || {})) {
+      const qId = Number(qIdStr);
+      const testCases = await dbAll("SELECT * FROM test_cases WHERE question_id=?", [qId]);
+      let qPassed = true;
+
+      for (const tc of testCases) {
+        const exec = await runStudentCode(lang.name, String(codeStr || ""), tc.input, tc.timeout_ms || 3000);
+        if (!exec.passed || normalizeOutput(exec.output) !== normalizeOutput(tc.expected_output)) {
+          qPassed = false;
+          break;
+        }
+      }
+
+      if (!qPassed) allQuestionsPassed = false;
+      results.push({ questionId: qId, passed: qPassed });
+    }
+
+    if (allQuestionsPassed && results.length >= 3) {
+      await dbRun("UPDATE student_language_belts SET current_belt_id=? WHERE user_id=? AND language_id=?", [bpr.target_belt_id, uid, lang.id]);
+      await dbRun("UPDATE belt_promotion_requests SET status='completed' WHERE id=?", [bpr.id]);
+      await dbRun("INSERT INTO belt_achievements(user_id,language_id,belt_id) VALUES(?,?,?) ON CONFLICT DO NOTHING", [uid, lang.id, bpr.target_belt_id]);
+      
+      await addStudentXP(uid, 100);
+
+      const newBelt: any = await dbGet("SELECT * FROM belts WHERE id=?", [bpr.target_belt_id]);
+      await dbRun("INSERT INTO notifications(user_id,title,message,type) VALUES(?,?,?,?)", [
+        uid,
+        `🥋 BELT PROMOTION ACHIEVED!`,
+        `Congratulations! You passed all 3 exam questions and earned your ${newBelt.name} in ${lang.name}!`,
+        "belt"
+      ]);
+
+      await logActivity(uid, "belt_promoted", { language: lang.name, beltId: bpr.target_belt_id });
+      return res.json({ success: true, message: `🎉 Promotion Achieved! You earned your ${newBelt.name} in ${lang.name}!`, belt: newBelt });
+    } else {
+      await dbRun("UPDATE belt_promotion_requests SET status='failed' WHERE id=?", [bpr.id]);
+      return res.json({ success: false, message: "Promotion exam not passed. Make sure to pass all test cases for all 3 questions. You can re-apply later!" });
+    }
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
   }
 });
 
 // ADMIN FEATURES: CONTENT CREATOR & BELT TEST QUESTION MANAGER
-app.post("/api/admin/topics", authMiddleware, requireRole("admin"), (req, res) => {
-  const { language_name, belt_name, name, description, content } = req.body || {};
-  if (!language_name || !name || !content) return res.status(400).json({ error: "Language, topic name, and content required" });
+app.post("/api/admin/topics", authMiddleware, requireRole("admin"), async (req, res) => {
+  try {
+    const { language_name, belt_name, name, description, content } = req.body || {};
+    if (!language_name || !name || !content) return res.status(400).json({ error: "Language, topic name, and content required" });
 
-  const lang: any = db.prepare("SELECT id FROM languages WHERE name=?").get(language_name);
-  if (!lang) return res.status(400).json({ error: "Invalid language" });
+    const lang: any = await dbGet("SELECT id FROM languages WHERE name=?", [language_name]);
+    if (!lang) return res.status(400).json({ error: "Invalid language" });
 
-  const belt: any = db.prepare("SELECT id FROM belts WHERE name=?").get(belt_name || "White Belt");
-  const beltId = belt ? belt.id : 1;
+    const belt: any = await dbGet("SELECT id FROM belts WHERE name=?", [belt_name || "White Belt"]);
+    const beltId = belt ? belt.id : 1;
 
-  const result = db.prepare(`
-    INSERT INTO topics(language_id, belt_id, name, description, content, sort_order)
-    VALUES(?, ?, ?, ?, ?, 99)
-  `).run(lang.id, beltId, name, description || '', content);
+    const result = await dbRun(`
+      INSERT INTO topics(language_id, belt_id, name, description, content, sort_order)
+      VALUES(?, ?, ?, ?, ?, 99)
+    `, [lang.id, beltId, name, description || '', content]);
 
-  res.json({ ok: true, topicId: Number(result.lastInsertRowid), message: "Topic created successfully!" });
+    res.json({ ok: true, topicId: result.lastInsertRowid, message: "Topic created successfully!" });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.post("/api/admin/questions", authMiddleware, requireRole("admin"), (req, res) => {
-  const { topic_id, title, statement, input_desc, output_desc, example_input, example_output, starter_code, is_belt_test, test_cases } = req.body || {};
-  if (!topic_id || !title || !statement) return res.status(400).json({ error: "Topic ID, title, and statement required" });
+app.post("/api/admin/questions", authMiddleware, requireRole("admin"), async (req, res) => {
+  try {
+    const { topic_id, title, statement, input_desc, output_desc, example_input, example_output, starter_code, is_belt_test, test_cases } = req.body || {};
+    if (!topic_id || !title || !statement) return res.status(400).json({ error: "Topic ID, title, and statement required" });
 
-  const result = db.prepare(`
-    INSERT INTO questions(topic_id, title, statement, input_desc, output_desc, constraints, example_input, example_output, is_belt_test)
-    VALUES(?, ?, ?, ?, ?, 'Standard Constraints', ?, ?, ?)
-  `).run(topic_id, title, statement, input_desc || '', output_desc || '', example_input || '', example_output || '', is_belt_test ? 1 : 0);
+    const result = await dbRun(`
+      INSERT INTO questions(topic_id, title, statement, input_desc, output_desc, constraints, example_input, example_output, is_belt_test)
+      VALUES(?, ?, ?, ?, ?, 'Standard Constraints', ?, ?, ?)
+    `, [topic_id, title, statement, input_desc || '', output_desc || '', example_input || '', example_output || '', is_belt_test ? 1 : 0]);
 
-  const qId = Number(result.lastInsertRowid);
+    const qId = result.lastInsertRowid;
 
-  if (Array.isArray(test_cases)) {
-    const insTest = db.prepare("INSERT INTO test_cases(question_id, input, expected_output, visible) VALUES(?,?,?,?)");
-    for (const tc of test_cases) {
-      if (tc.input !== undefined && tc.expected_output !== undefined) {
-        insTest.run(qId, String(tc.input), String(tc.expected_output), tc.visible ? 1 : 0);
+    if (Array.isArray(test_cases)) {
+      for (const tc of test_cases) {
+        if (tc.input !== undefined && tc.expected_output !== undefined) {
+          await dbRun("INSERT INTO test_cases(question_id, input, expected_output, visible) VALUES(?,?,?,?)", [qId, String(tc.input), String(tc.expected_output), tc.visible ? 1 : 0]);
+        }
       }
     }
+
+    res.json({ ok: true, questionId: qId, message: "Question and test cases created!" });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
   }
-
-  res.json({ ok: true, questionId: qId, message: "Question and test cases created!" });
 });
 
-app.get("/api/admin/belt-test-questions", authMiddleware, requireRole("admin"), (req, res) => {
-  const questions = db.prepare(`
-    SELECT q.*, t.name topic_name, l.name language_name, b.name belt_name
-    FROM questions q
-    JOIN topics t ON t.id = q.topic_id
-    JOIN languages l ON l.id = t.language_id
-    JOIN belts b ON b.id = t.belt_id
-    WHERE q.is_belt_test = 1 OR q.active = 1
-    ORDER BY l.id ASC, b.sort_order ASC, q.id DESC
-  `).all();
-  res.json(questions);
+app.get("/api/admin/belt-test-questions", authMiddleware, requireRole("admin"), async (req, res) => {
+  try {
+    const questions = await dbAll(`
+      SELECT q.*, t.name topic_name, l.name language_name, b.name belt_name
+      FROM questions q
+      JOIN topics t ON t.id = q.topic_id
+      JOIN languages l ON l.id = t.language_id
+      JOIN belts b ON b.id = t.belt_id
+      WHERE q.is_belt_test = 1 OR q.active = 1
+      ORDER BY l.id ASC, b.sort_order ASC, q.id DESC
+    `);
+    res.json(questions);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.put("/api/admin/questions/:id", authMiddleware, requireRole("admin"), (req, res) => {
-  const qId = Number(req.params.id);
-  const { title, statement, is_belt_test } = req.body || {};
+app.put("/api/admin/questions/:id", authMiddleware, requireRole("admin"), async (req, res) => {
+  try {
+    const qId = Number(req.params.id);
+    const { title, statement, is_belt_test } = req.body || {};
 
-  db.prepare(`
-    UPDATE questions SET title=?, statement=?, is_belt_test=? WHERE id=?
-  `).run(title, statement, is_belt_test ? 1 : 0, qId);
+    await dbRun(`
+      UPDATE questions SET title=?, statement=?, is_belt_test=? WHERE id=?
+    `, [title, statement, is_belt_test ? 1 : 0, qId]);
 
-  res.json({ ok: true, message: "Question updated successfully!" });
+    res.json({ ok: true, message: "Question updated successfully!" });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.delete("/api/admin/questions/:id", authMiddleware, requireRole("admin"), (req, res) => {
-  const qId = Number(req.params.id);
-  db.prepare("DELETE FROM test_cases WHERE question_id=?").run(qId);
-  db.prepare("DELETE FROM questions WHERE id=?").run(qId);
-  res.json({ ok: true, message: "Question deleted successfully!" });
+app.delete("/api/admin/questions/:id", authMiddleware, requireRole("admin"), async (req, res) => {
+  try {
+    const qId = Number(req.params.id);
+    await dbRun("DELETE FROM test_cases WHERE question_id=?", [qId]);
+    await dbRun("DELETE FROM questions WHERE id=?", [qId]);
+    res.json({ ok: true, message: "Question deleted successfully!" });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // STAFF PORTAL
-app.get("/api/staff/promotions", authMiddleware, requireRole("staff", "admin"), (req, res) => {
-  const requests = db.prepare(`
-    SELECT bpr.*, u.name student_name, u.email student_email, l.name language_name,
-           cb.name current_belt_name, tb.name target_belt_name
-    FROM belt_promotion_requests bpr
-    JOIN users u ON u.id = bpr.user_id
-    JOIN languages l ON l.id = bpr.language_id
-    JOIN belts cb ON cb.id = bpr.current_belt_id
-    JOIN belts tb ON tb.id = bpr.target_belt_id
-    WHERE bpr.status = 'pending'
-    ORDER BY bpr.id DESC
-  `).all();
-  res.json(requests);
+app.get("/api/staff/promotions", authMiddleware, requireRole("staff", "admin"), async (req, res) => {
+  try {
+    const requests = await dbAll(`
+      SELECT bpr.*, u.name student_name, u.email student_email, l.name language_name,
+             cb.name current_belt_name, tb.name target_belt_name
+      FROM belt_promotion_requests bpr
+      JOIN users u ON u.id = bpr.user_id
+      JOIN languages l ON l.id = bpr.language_id
+      JOIN belts cb ON cb.id = bpr.current_belt_id
+      JOIN belts tb ON tb.id = bpr.target_belt_id
+      WHERE bpr.status = 'pending'
+      ORDER BY bpr.id DESC
+    `);
+    res.json(requests);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.post("/api/staff/promotions/:id/review", authMiddleware, requireRole("staff", "admin"), (req: AuthReq, res) => {
-  const reqId = Number(req.params.id);
-  const { action } = req.body || {};
+app.post("/api/staff/promotions/:id/review", authMiddleware, requireRole("staff", "admin"), async (req: AuthReq, res) => {
+  try {
+    const reqId = Number(req.params.id);
+    const { action } = req.body || {};
 
-  const bpr: any = db.prepare("SELECT * FROM belt_promotion_requests WHERE id=?").get(reqId);
-  if (!bpr) return res.status(404).json({ error: "Promotion request not found" });
+    const bpr: any = await dbGet("SELECT * FROM belt_promotion_requests WHERE id=?", [reqId]);
+    if (!bpr) return res.status(404).json({ error: "Promotion request not found" });
 
-  const status = action === 'approved' ? 'approved' : 'rejected';
-  db.prepare("UPDATE belt_promotion_requests SET status=?, reviewed_at=CURRENT_TIMESTAMP, reviewed_by=? WHERE id=?").run(status, req.user.id, reqId);
+    const status = action === 'approved' ? 'approved' : 'rejected';
+    await dbRun("UPDATE belt_promotion_requests SET status=?, reviewed_at=CURRENT_TIMESTAMP, reviewed_by=? WHERE id=?", [status, req.user.id, reqId]);
 
-  const lang: any = db.prepare("SELECT name FROM languages WHERE id=?").get(bpr.language_id);
+    const lang: any = await dbGet("SELECT name FROM languages WHERE id=?", [bpr.language_id]);
 
-  if (action === 'approved') {
-    db.prepare("INSERT INTO notifications(user_id,title,message,type) VALUES(?,?,?,?)").run(
-      bpr.user_id,
-      "🥋 Promotion Approved!",
-      `Sensei has approved your promotion test for ${lang?.name || 'Language'}! Open Belt Test page to complete 3 exam questions.`,
-      "belt"
-    );
-  } else {
-    db.prepare("INSERT INTO notifications(user_id,title,message,type) VALUES(?,?,?,?)").run(
-      bpr.user_id,
-      "⚠️ Promotion Request Rejected",
-      `Sensei reviewed your promotion request for ${lang?.name || 'Language'}. Please practice topics further and feel free to re-apply anytime!`,
-      "info"
-    );
+    if (action === 'approved') {
+      await dbRun("INSERT INTO notifications(user_id,title,message,type) VALUES(?,?,?,?)", [
+        bpr.user_id,
+        "🥋 Promotion Approved!",
+        `Sensei has approved your promotion test for ${lang?.name || 'Language'}! Open Belt Test page to complete 3 exam questions.`,
+        "belt"
+      ]);
+    } else {
+      await dbRun("INSERT INTO notifications(user_id,title,message,type) VALUES(?,?,?,?)", [
+        bpr.user_id,
+        "⚠️ Promotion Request Rejected",
+        `Sensei reviewed your promotion request for ${lang?.name || 'Language'}. Please practice topics further and feel free to re-apply anytime!`,
+        "info"
+      ]);
+    }
+
+    await logActivity(req.user.id, "promotion_reviewed", { requestId: reqId, status });
+    res.json({ ok: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
   }
-
-  logActivity(req.user.id, "promotion_reviewed", { requestId: reqId, status });
-  res.json({ ok: true });
 });
 
 // QUESTIONS & TESTS
-app.get("/api/questions/:id", authMiddleware, (req: AuthReq, res) => {
-  const q: any = db.prepare(`
-    SELECT q.*, t.name topic_name, l.name language_name, b.name belt_name
-    FROM questions q
-    JOIN topics t ON t.id = q.topic_id
-    JOIN languages l ON l.id = t.language_id
-    JOIN belts b ON b.id = t.belt_id
-    WHERE q.id = ? AND q.active = 1
-  `).get(Number(req.params.id));
+app.get("/api/questions/:id", authMiddleware, async (req: AuthReq, res) => {
+  try {
+    const qId = Number(req.params.id);
+    const q: any = await dbGet(`
+      SELECT q.*, t.name topic_name, l.name language_name, b.name belt_name
+      FROM questions q
+      JOIN topics t ON t.id = q.topic_id
+      JOIN languages l ON l.id = t.language_id
+      JOIN belts b ON b.id = t.belt_id
+      WHERE q.id = ? AND q.active = 1
+    `, [qId]);
 
-  if (!q) return res.status(404).json({ error: "Question not found" });
+    if (!q) return res.status(404).json({ error: "Question not found" });
 
-  const visibleCases = db.prepare("SELECT id, input, expected_output, timeout_ms FROM test_cases WHERE question_id=? AND visible=1 ORDER BY id ASC").all(q.id);
-  const hiddenCount = (db.prepare("SELECT COUNT(*) c FROM test_cases WHERE question_id=? AND visible=0").get(q.id) as any).c;
+    const visibleCases = await dbAll("SELECT id, input, expected_output, timeout_ms FROM test_cases WHERE question_id=? AND visible=1 ORDER BY id ASC", [q.id]);
+    const hiddenCount = Number((await dbGet("SELECT COUNT(*) c FROM test_cases WHERE question_id=? AND visible=0", [q.id]))?.c || 0);
 
-  const progress: any = db.prepare("SELECT solved, attempts FROM question_progress WHERE user_id=? AND question_id=?").get(req.user.id, q.id) || { solved: 0, attempts: 0 };
-  const isBookmarked = db.prepare("SELECT 1 FROM bookmarks WHERE user_id=? AND item_type='question' AND item_id=?").get(req.user.id, q.id) ? 1 : 0;
+    const progress: any = (await dbGet("SELECT solved, attempts FROM question_progress WHERE user_id=? AND question_id=?", [req.user.id, q.id])) || { solved: 0, attempts: 0 };
+    const isBookmarked = (await dbGet("SELECT 1 FROM bookmarks WHERE user_id=? AND item_type='question' AND item_id=?", [req.user.id, q.id])) ? 1 : 0;
 
-  res.json({
-    ...q,
-    visibleTestCases: visibleCases,
-    hiddenTestCasesCount: hiddenCount,
-    solved: progress.solved,
-    attempts: progress.attempts,
-    bookmarked: isBookmarked
-  });
+    res.json({
+      ...q,
+      visibleTestCases: visibleCases,
+      hiddenTestCasesCount: hiddenCount,
+      solved: progress.solved,
+      attempts: progress.attempts,
+      bookmarked: isBookmarked
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.post("/api/questions/:id/run", authMiddleware, async (req: AuthReq, res) => {
-  const { code, language } = req.body || {};
-  const qId = Number(req.params.id);
+  try {
+    const { code, language } = req.body || {};
+    const qId = Number(req.params.id);
 
-  const q: any = db.prepare("SELECT * FROM questions WHERE id=? AND active=1").get(qId);
-  if (!q) return res.status(404).json({ error: "Question not found" });
+    const q: any = await dbGet("SELECT * FROM questions WHERE id=? AND active=1", [qId]);
+    if (!q) return res.status(404).json({ error: "Question not found" });
 
-  const allTestCases = db.prepare("SELECT * FROM test_cases WHERE question_id=? ORDER BY visible DESC, id ASC").all(qId) as any[];
+    const allTestCases = await dbAll("SELECT * FROM test_cases WHERE question_id=? ORDER BY visible DESC, id ASC", [qId]);
 
-  const visibleResults = [];
-  let hiddenPassedCount = 0;
-  let hiddenTotalCount = 0;
-  let allPassed = true;
+    const visibleResults = [];
+    let hiddenPassedCount = 0;
+    let hiddenTotalCount = 0;
+    let allPassed = true;
 
-  for (const tc of allTestCases) {
-    const exec = await runStudentCode(language || "Python", code || "", tc.input, tc.timeout_ms || 3000);
-    const normalizedActual = normalizeOutput(exec.output);
-    const normalizedExpected = normalizeOutput(tc.expected_output);
-    const passed = exec.passed && normalizedActual === normalizedExpected;
+    for (const tc of allTestCases) {
+      const exec = await runStudentCode(language || "Python", code || "", tc.input, tc.timeout_ms || 3000);
+      const normalizedActual = normalizeOutput(exec.output);
+      const normalizedExpected = normalizeOutput(tc.expected_output);
+      const passed = exec.passed && normalizedActual === normalizedExpected;
 
-    if (!passed) allPassed = false;
+      if (!passed) allPassed = false;
 
-    if (tc.visible === 1) {
-      visibleResults.push({
-        testNumber: visibleResults.length + 1,
-        input: tc.input,
-        expectedOutput: tc.expected_output,
-        actualOutput: exec.output,
-        status: passed ? "passed" : exec.error || "failed"
-      });
-    } else {
-      hiddenTotalCount++;
-      if (passed) hiddenPassedCount++;
+      if (tc.visible === 1) {
+        visibleResults.push({
+          testNumber: visibleResults.length + 1,
+          input: tc.input,
+          expectedOutput: tc.expected_output,
+          actualOutput: exec.output,
+          status: passed ? "passed" : exec.error || "failed"
+        });
+      } else {
+        hiddenTotalCount++;
+        if (passed) hiddenPassedCount++;
+      }
     }
+
+    if (isPg) {
+      await dbRun("INSERT INTO question_progress(user_id, question_id, attempts) VALUES(?, ?, 1) ON CONFLICT(user_id, question_id) DO UPDATE SET attempts = question_progress.attempts + 1", [req.user.id, qId]);
+    } else {
+      await dbRun("INSERT INTO question_progress(user_id, question_id, attempts) VALUES(?, ?, 1) ON CONFLICT(user_id, question_id) DO UPDATE SET attempts = attempts + 1", [req.user.id, qId]);
+    }
+
+    res.json({
+      status: "completed",
+      visibleTests: visibleResults,
+      hiddenTests: {
+        passed: hiddenPassedCount,
+        total: hiddenTotalCount
+      },
+      canSubmit: allPassed
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
   }
-
-  db.prepare(`
-    INSERT INTO question_progress(user_id, question_id, attempts) VALUES(?, ?, 1)
-    ON CONFLICT(user_id, question_id) DO UPDATE SET attempts = attempts + 1
-  `).run(req.user.id, qId);
-
-  res.json({
-    status: "completed",
-    visibleTests: visibleResults,
-    hiddenTests: {
-      passed: hiddenPassedCount,
-      total: hiddenTotalCount
-    },
-    canSubmit: allPassed
-  });
 });
 
 app.post("/api/questions/:id/submit", authMiddleware, async (req: AuthReq, res) => {
-  const { code, language } = req.body || {};
-  const qId = Number(req.params.id);
+  try {
+    const { code, language } = req.body || {};
+    const qId = Number(req.params.id);
 
-  const q: any = db.prepare("SELECT * FROM questions WHERE id=? AND active=1").get(qId);
-  if (!q) return res.status(404).json({ error: "Question not found" });
+    const q: any = await dbGet("SELECT * FROM questions WHERE id=? AND active=1", [qId]);
+    if (!q) return res.status(404).json({ error: "Question not found" });
 
-  const allTestCases = db.prepare("SELECT * FROM test_cases WHERE question_id=? ORDER BY id ASC").all(qId) as any[];
+    const allTestCases = await dbAll("SELECT * FROM test_cases WHERE question_id=? ORDER BY id ASC", [qId]);
 
-  let visiblePassed = 0;
-  let hiddenPassed = 0;
-  let visibleTotal = 0;
-  let hiddenTotal = 0;
+    let visiblePassed = 0;
+    let hiddenPassed = 0;
+    let visibleTotal = 0;
+    let hiddenTotal = 0;
 
-  for (const tc of allTestCases) {
-    const exec = await runStudentCode(language || "Python", code || "", tc.input, tc.timeout_ms || 3000);
-    const passed = exec.passed && normalizeOutput(exec.output) === normalizeOutput(tc.expected_output);
+    for (const tc of allTestCases) {
+      const exec = await runStudentCode(language || "Python", code || "", tc.input, tc.timeout_ms || 3000);
+      const passed = exec.passed && normalizeOutput(exec.output) === normalizeOutput(tc.expected_output);
 
-    if (tc.visible === 1) {
-      visibleTotal++;
-      if (passed) visiblePassed++;
-    } else {
-      hiddenTotal++;
-      if (passed) hiddenPassed++;
+      if (tc.visible === 1) {
+        visibleTotal++;
+        if (passed) visiblePassed++;
+      } else {
+        hiddenTotal++;
+        if (passed) hiddenPassed++;
+      }
     }
-  }
 
-  const totalPassed = visiblePassed + hiddenPassed;
-  const totalCases = visibleTotal + hiddenTotal;
-  const isFullyPassed = totalPassed === totalCases && totalCases > 0;
+    const totalPassed = visiblePassed + hiddenPassed;
+    const totalCases = visibleTotal + hiddenTotal;
+    const isFullyPassed = totalPassed === totalCases && totalCases > 0;
 
-  db.prepare(`
-    INSERT INTO submissions(user_id, question_id, language, code, passed, visible_passed, hidden_passed, total_tests)
-    VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(req.user.id, qId, language || "Python", code || "", isFullyPassed ? 1 : 0, visiblePassed, hiddenPassed, totalCases);
+    await dbRun(`
+      INSERT INTO submissions(user_id, question_id, language, code, passed, visible_passed, hidden_passed, total_tests)
+      VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+    `, [req.user.id, qId, language || "Python", code || "", isFullyPassed ? 1 : 0, visiblePassed, hiddenPassed, totalCases]);
 
-  if (!isFullyPassed) {
-    return res.json({
-      success: false,
-      message: `Only ${totalPassed}/${totalCases} test cases passed. Edit code and try again!`,
-      visiblePassed,
-      hiddenPassed
+    if (!isFullyPassed) {
+      return res.json({
+        success: false,
+        message: `Only ${totalPassed}/${totalCases} test cases passed. Edit code and try again!`,
+        visiblePassed,
+        hiddenPassed
+      });
+    }
+
+    if (isPg) {
+      await dbRun(`
+        INSERT INTO question_progress(user_id, question_id, solved, attempts, solved_at)
+        VALUES(?, ?, 1, 1, CURRENT_TIMESTAMP)
+        ON CONFLICT(user_id, question_id) DO UPDATE SET solved = 1, solved_at = CURRENT_TIMESTAMP
+      `, [req.user.id, qId]);
+    } else {
+      await dbRun(`
+        INSERT INTO question_progress(user_id, question_id, solved, attempts, solved_at)
+        VALUES(?, ?, 1, 1, CURRENT_TIMESTAMP)
+        ON CONFLICT(user_id, question_id) DO UPDATE SET solved = 1, solved_at = CURRENT_TIMESTAMP
+      `, [req.user.id, qId]);
+    }
+
+    const xpBonus = q.required ? 50 : 25;
+    await addStudentXP(req.user.id, xpBonus);
+    await logActivity(req.user.id, "question_solved", { questionId: qId, xp: xpBonus });
+
+    res.json({
+      success: true,
+      xpEarned: xpBonus,
+      message: "🎉 Question Verified! All required test cases passed."
     });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
   }
-
-  db.prepare(`
-    INSERT INTO question_progress(user_id, question_id, solved, attempts, solved_at)
-    VALUES(?, ?, 1, 1, CURRENT_TIMESTAMP)
-    ON CONFLICT(user_id, question_id) DO UPDATE SET solved = 1, solved_at = CURRENT_TIMESTAMP
-  `).run(req.user.id, qId);
-
-  const xpBonus = q.required ? 50 : 25;
-  addStudentXP(req.user.id, xpBonus);
-  logActivity(req.user.id, "question_solved", { questionId: qId, xp: xpBonus });
-
-  res.json({
-    success: true,
-    xpEarned: xpBonus,
-    message: "🎉 Question Verified! All required test cases passed."
-  });
 });
 
 // PROGRESS & ANALYTICS
-app.get("/api/progress", authMiddleware, (req: AuthReq, res) => {
-  const uid = req.user.id;
-  const profile: any = db.prepare("SELECT * FROM student_profiles WHERE user_id=?").get(uid) || { xp: 0, streak_days: 0 };
-  
-  const solvedCount = (db.prepare("SELECT COUNT(*) c FROM question_progress WHERE user_id=? AND solved=1").get(uid) as any).c;
-  const attemptedCount = (db.prepare("SELECT COALESCE(SUM(attempts), 0) c FROM question_progress WHERE user_id=?").get(uid) as any).c;
-  const completedLessons = (db.prepare("SELECT COUNT(*) c FROM content_progress WHERE user_id=? AND completed_at IS NOT NULL").get(uid) as any).c;
-  const totalLessons = (db.prepare("SELECT COUNT(*) c FROM topics WHERE active=1").get() as any).c;
-
-  const languages = db.prepare("SELECT * FROM languages WHERE enabled=1").all() as any[];
-  const languageStats = languages.map(l => {
-    const slb: any = db.prepare("SELECT current_belt_id FROM student_language_belts WHERE user_id=? AND language_id=?").get(uid, l.id) || { current_belt_id: 1 };
-    const b: any = db.prepare("SELECT * FROM belts WHERE id=?").get(slb.current_belt_id);
+app.get("/api/progress", authMiddleware, async (req: AuthReq, res) => {
+  try {
+    const uid = req.user.id;
+    const profile: any = (await dbGet("SELECT * FROM student_profiles WHERE user_id=?", [uid])) || { xp: 0, streak_days: 0 };
     
-    const completedTopics = (db.prepare(`
-      SELECT COUNT(DISTINCT cp.topic_id) c FROM content_progress cp
+    const solvedCount = Number((await dbGet("SELECT COUNT(*) c FROM question_progress WHERE user_id=? AND solved=1", [uid]))?.c || 0);
+    const attemptedCount = Number((await dbGet("SELECT COALESCE(SUM(attempts), 0) c FROM question_progress WHERE user_id=?", [uid]))?.c || 0);
+    const completedLessons = Number((await dbGet("SELECT COUNT(*) c FROM content_progress WHERE user_id=? AND completed_at IS NOT NULL", [uid]))?.c || 0);
+    const totalLessons = Number((await dbGet("SELECT COUNT(*) c FROM topics WHERE active=1"))?.c || 0);
+
+    const languages = await dbAll("SELECT * FROM languages WHERE enabled=1");
+    const languageStats = [];
+
+    for (const l of languages) {
+      const slb: any = (await dbGet("SELECT current_belt_id FROM student_language_belts WHERE user_id=? AND language_id=?", [uid, l.id])) || { current_belt_id: 1 };
+      const b: any = await dbGet("SELECT * FROM belts WHERE id=?", [slb.current_belt_id]);
+      
+      const completedTopics = Number((await dbGet(`
+        SELECT COUNT(DISTINCT cp.topic_id) c FROM content_progress cp
+        JOIN topics t ON t.id = cp.topic_id
+        WHERE cp.user_id=? AND t.language_id=? AND cp.completed_at IS NOT NULL
+      `, [uid, l.id]))?.c || 0);
+
+      const totalTopics = Number((await dbGet("SELECT COUNT(*) c FROM topics WHERE language_id=? AND active=1", [l.id]))?.c || 0);
+      const progressPercent = totalTopics > 0 ? Math.round((completedTopics / totalTopics) * 100) : 0;
+
+      languageStats.push({
+        name: l.name,
+        beltName: b?.name || 'White Belt',
+        beltColor: b?.color_hex || '#E2E8F0',
+        completedTopics,
+        totalTopics,
+        progressPercent
+      });
+    }
+
+    const belts = await dbAll("SELECT * FROM belts ORDER BY sort_order ASC");
+    const beltStats = [];
+
+    for (const b of belts) {
+      const solvedInBelt = Number((await dbGet(`
+        SELECT COUNT(DISTINCT qp.question_id) c
+        FROM question_progress qp
+        JOIN questions q ON q.id = qp.question_id
+        JOIN topics t ON t.id = q.topic_id
+        WHERE qp.user_id=? AND qp.solved=1 AND t.belt_id=?
+      `, [uid, b.id]))?.c || 0);
+
+      beltStats.push({
+        beltName: b.name,
+        beltColor: b.color_hex,
+        solvedCount: solvedInBelt
+      });
+    }
+
+    res.json({
+      xp: profile.xp,
+      streak: profile.streak_days,
+      solvedQuestions: solvedCount,
+      attemptedQuestions: attemptedCount,
+      successRate: attemptedCount > 0 ? Math.round((solvedCount / attemptedCount) * 100) : 100,
+      completedLessons,
+      totalLessons,
+      languageStats,
+      beltStats
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/activity", authMiddleware, async (req: AuthReq, res) => {
+  try {
+    res.json(await dbAll("SELECT * FROM activity_logs WHERE user_id=? ORDER BY id DESC LIMIT 15", [req.user.id]));
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/revisit", authMiddleware, async (req: AuthReq, res) => {
+  try {
+    const uid = req.user.id;
+    const completedLessons = await dbAll(`
+      SELECT t.*, l.name language_name, cp.completed_at
+      FROM content_progress cp
       JOIN topics t ON t.id = cp.topic_id
-      WHERE cp.user_id=? AND t.language_id=? AND cp.completed_at IS NOT NULL
-    `).get(uid, l.id) as any).c;
+      JOIN languages l ON l.id = t.language_id
+      WHERE cp.user_id = ? AND cp.completed_at IS NOT NULL
+      ORDER BY cp.completed_at DESC
+    `, [uid]);
 
-    const totalTopics = (db.prepare("SELECT COUNT(*) c FROM topics WHERE language_id=? AND active=1").get(l.id) as any).c;
-    const progressPercent = totalTopics > 0 ? Math.round((completedTopics / totalTopics) * 100) : 0;
+    const weakTopics = await dbAll(`
+      SELECT t.id topic_id, t.name topic_name, l.name language_name,
+             COUNT(q.id) total_q,
+             SUM(CASE WHEN qp.solved=1 THEN 1 ELSE 0 END) solved_q
+      FROM topics t
+      JOIN languages l ON l.id = t.language_id
+      JOIN questions q ON q.topic_id = t.id
+      LEFT JOIN question_progress qp ON qp.question_id = q.id AND qp.user_id = ?
+      WHERE t.active = 1
+      GROUP BY t.id, t.name, l.name
+      HAVING COUNT(q.id) > 0 AND (SUM(CASE WHEN qp.solved=1 THEN 1 ELSE 0 END) * 1.0 / COUNT(q.id)) < 0.6
+    `, [uid]);
 
-    return {
-      name: l.name,
-      beltName: b?.name || 'White Belt',
-      beltColor: b?.color_hex || '#E2E8F0',
-      completedTopics,
-      totalTopics,
-      progressPercent
-    };
-  });
-
-  const belts = db.prepare("SELECT * FROM belts ORDER BY sort_order ASC").all() as any[];
-  const beltStats = belts.map(b => {
-    const solvedInBelt = (db.prepare(`
-      SELECT COUNT(DISTINCT qp.question_id) c
-      FROM question_progress qp
-      JOIN questions q ON q.id = qp.question_id
-      JOIN topics t ON t.id = q.topic_id
-      WHERE qp.user_id=? AND qp.solved=1 AND t.belt_id=?
-    `).get(uid, b.id) as any).c;
-
-    return {
-      beltName: b.name,
-      beltColor: b.color_hex,
-      solvedCount: solvedInBelt
-    };
-  });
-
-  res.json({
-    xp: profile.xp,
-    streak: profile.streak_days,
-    solvedQuestions: solvedCount,
-    attemptedQuestions: attemptedCount,
-    successRate: attemptedCount > 0 ? Math.round((solvedCount / attemptedCount) * 100) : 100,
-    completedLessons,
-    totalLessons,
-    languageStats,
-    beltStats
-  });
+    res.json({ completedLessons, weakTopics });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.get("/api/activity", authMiddleware, (req: AuthReq, res) => {
-  res.json(db.prepare("SELECT * FROM activity_logs WHERE user_id=? ORDER BY id DESC LIMIT 15").all(req.user.id));
+app.get("/api/bookmarks", authMiddleware, async (req: AuthReq, res) => {
+  try {
+    res.json(await dbAll("SELECT * FROM bookmarks WHERE user_id=? ORDER BY created_at DESC", [req.user.id]));
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.get("/api/revisit", authMiddleware, (req: AuthReq, res) => {
-  const uid = req.user.id;
-  const completedLessons = db.prepare(`
-    SELECT t.*, l.name language_name, cp.completed_at
-    FROM content_progress cp
-    JOIN topics t ON t.id = cp.topic_id
-    JOIN languages l ON l.id = t.language_id
-    WHERE cp.user_id = ? AND cp.completed_at IS NOT NULL
-    ORDER BY cp.completed_at DESC
-  `).all(uid);
-
-  const weakTopics = db.prepare(`
-    SELECT t.id topic_id, t.name topic_name, l.name language_name,
-           COUNT(q.id) total_q,
-           SUM(CASE WHEN qp.solved=1 THEN 1 ELSE 0 END) solved_q
-    FROM topics t
-    JOIN languages l ON l.id = t.language_id
-    JOIN questions q ON q.topic_id = t.id
-    LEFT JOIN question_progress qp ON qp.question_id = q.id AND qp.user_id = ?
-    WHERE t.active = 1
-    GROUP BY t.id
-    HAVING total_q > 0 AND (solved_q * 1.0 / total_q) < 0.6
-  `).all(uid);
-
-  res.json({ completedLessons, weakTopics });
-});
-
-app.get("/api/bookmarks", authMiddleware, (req: AuthReq, res) => {
-  res.json(db.prepare("SELECT * FROM bookmarks WHERE user_id=? ORDER BY created_at DESC").all(req.user.id));
-});
-
-app.post("/api/bookmarks/toggle", authMiddleware, (req: AuthReq, res) => {
-  const { item_type, item_id } = req.body || {};
-  const existing = db.prepare("SELECT 1 FROM bookmarks WHERE user_id=? AND item_type=? AND item_id=?").get(req.user.id, item_type, item_id);
-  
-  if (existing) {
-    db.prepare("DELETE FROM bookmarks WHERE user_id=? AND item_type=? AND item_id=?").run(req.user.id, item_type, item_id);
-    res.json({ bookmarked: false });
-  } else {
-    db.prepare("INSERT INTO bookmarks(user_id, item_type, item_id) VALUES(?, ?, ?)").run(req.user.id, item_type, item_id);
-    res.json({ bookmarked: true });
+app.post("/api/bookmarks/toggle", authMiddleware, async (req: AuthReq, res) => {
+  try {
+    const { item_type, item_id } = req.body || {};
+    const existing = await dbGet("SELECT 1 FROM bookmarks WHERE user_id=? AND item_type=? AND item_id=?", [req.user.id, item_type, item_id]);
+    
+    if (existing) {
+      await dbRun("DELETE FROM bookmarks WHERE user_id=? AND item_type=? AND item_id=?", [req.user.id, item_type, item_id]);
+      res.json({ bookmarked: false });
+    } else {
+      await dbRun("INSERT INTO bookmarks(user_id, item_type, item_id) VALUES(?, ?, ?)", [req.user.id, item_type, item_id]);
+      res.json({ bookmarked: true });
+    }
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
   }
 });
 
 // STAFF PORTAL
-app.get("/api/staff/dashboard", authMiddleware, requireRole("staff", "admin"), (req, res) => {
-  const totalStudents = (db.prepare("SELECT COUNT(*) c FROM users WHERE role='student'").get() as any).c;
-  const activeStudents = (db.prepare("SELECT COUNT(DISTINCT user_id) c FROM student_profiles WHERE last_active_date >= date('now', '-7 days')").get() as any).c;
-  const needsAttention = (db.prepare("SELECT COUNT(*) c FROM student_profiles WHERE streak_days = 0 OR xp < 50").get() as any).c;
+app.get("/api/staff/dashboard", authMiddleware, requireRole("staff", "admin"), async (req, res) => {
+  try {
+    const totalStudents = Number((await dbGet("SELECT COUNT(*) c FROM users WHERE role='student'"))?.c || 0);
+    const activeStudents = Number((await dbGet("SELECT COUNT(DISTINCT user_id) c FROM student_profiles WHERE last_active_date >= date('now', '-7 days')"))?.c || 0);
+    const needsAttention = Number((await dbGet("SELECT COUNT(*) c FROM student_profiles WHERE streak_days = 0 OR xp < 50"))?.c || 0);
 
-  res.json({ totalStudents, activeStudents, needsAttention });
+    res.json({ totalStudents, activeStudents, needsAttention });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.get("/api/staff/students", authMiddleware, requireRole("staff", "admin"), (req, res) => {
-  const students = db.prepare(`
-    SELECT u.id, u.name, u.email, u.selected_language, u.created_at,
-           p.xp, p.streak_days, p.last_active_date,
-           (SELECT COUNT(*) FROM question_progress qp WHERE qp.user_id = u.id AND qp.solved = 1) solved_count
-    FROM users u
-    LEFT JOIN student_profiles p ON p.user_id = u.id
-    WHERE u.role = 'student'
-    ORDER BY u.id DESC
-  `).all();
-  res.json(students);
+app.get("/api/staff/students", authMiddleware, requireRole("staff", "admin"), async (req, res) => {
+  try {
+    const students = await dbAll(`
+      SELECT u.id, u.name, u.email, u.selected_language, u.created_at,
+             p.xp, p.streak_days, p.last_active_date,
+             (SELECT COUNT(*) FROM question_progress qp WHERE qp.user_id = u.id AND qp.solved = 1) solved_count
+      FROM users u
+      LEFT JOIN student_profiles p ON p.user_id = u.id
+      WHERE u.role = 'student'
+      ORDER BY u.id DESC
+    `);
+    res.json(students);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.get("/api/staff/students/:id", authMiddleware, requireRole("staff", "admin"), (req, res) => {
-  const sId = Number(req.params.id);
-  const u: any = db.prepare("SELECT id, name, email, selected_language, created_at FROM users WHERE id=? AND role='student'").get(sId);
-  if (!u) return res.status(404).json({ error: "Student not found" });
+app.get("/api/staff/students/:id", authMiddleware, requireRole("staff", "admin"), async (req, res) => {
+  try {
+    const sId = Number(req.params.id);
+    const u: any = await dbGet("SELECT id, name, email, selected_language, created_at FROM users WHERE id=? AND role='student'", [sId]);
+    if (!u) return res.status(404).json({ error: "Student not found" });
 
-  const profile: any = db.prepare("SELECT * FROM student_profiles WHERE user_id=?").get(sId);
-  
-  const languages = db.prepare("SELECT * FROM languages WHERE enabled=1").all() as any[];
-  const languageBelts = languages.map(l => {
-    const slb: any = db.prepare("SELECT current_belt_id FROM student_language_belts WHERE user_id=? AND language_id=?").get(sId, l.id) || { current_belt_id: 1 };
-    const b: any = db.prepare("SELECT * FROM belts WHERE id=?").get(slb.current_belt_id);
-    return {
-      language: l.name,
-      beltName: b?.name || 'White Belt',
-      beltColor: b?.color_hex || '#E2E8F0'
-    };
-  });
+    const profile: any = await dbGet("SELECT * FROM student_profiles WHERE user_id=?", [sId]);
+    
+    const languages = await dbAll("SELECT * FROM languages WHERE enabled=1");
+    const languageBelts = [];
+    for (const l of languages) {
+      const slb: any = (await dbGet("SELECT current_belt_id FROM student_language_belts WHERE user_id=? AND language_id=?", [sId, l.id])) || { current_belt_id: 1 };
+      const b: any = await dbGet("SELECT * FROM belts WHERE id=?", [slb.current_belt_id]);
+      languageBelts.push({
+        language: l.name,
+        beltName: b?.name || 'White Belt',
+        beltColor: b?.color_hex || '#E2E8F0'
+      });
+    }
 
-  const solvedCount = (db.prepare("SELECT COUNT(*) c FROM question_progress WHERE user_id=? AND solved=1").get(sId) as any).c;
-  const totalQuestions = (db.prepare("SELECT COUNT(*) c FROM questions WHERE active=1").get() as any).c;
-  const progressPercent = totalQuestions > 0 ? Math.round((solvedCount / totalQuestions) * 100) : 0;
+    const solvedCount = Number((await dbGet("SELECT COUNT(*) c FROM question_progress WHERE user_id=? AND solved=1", [sId]))?.c || 0);
+    const totalQuestions = Number((await dbGet("SELECT COUNT(*) c FROM questions WHERE active=1"))?.c || 0);
+    const progressPercent = totalQuestions > 0 ? Math.round((solvedCount / totalQuestions) * 100) : 0;
 
-  const completedTopics = db.prepare(`
-    SELECT t.name topic_name, l.name language_name, cp.completed_at
-    FROM content_progress cp
-    JOIN topics t ON t.id = cp.topic_id
-    JOIN languages l ON l.id = t.language_id
-    WHERE cp.user_id=? AND cp.completed_at IS NOT NULL
-  `).all(sId);
+    const completedTopics = await dbAll(`
+      SELECT t.name topic_name, l.name language_name, cp.completed_at
+      FROM content_progress cp
+      JOIN topics t ON t.id = cp.topic_id
+      JOIN languages l ON l.id = t.language_id
+      WHERE cp.user_id=? AND cp.completed_at IS NOT NULL
+    `, [sId]);
 
-  const recentSubmissions = db.prepare(`
-    SELECT s.*, q.title question_title
-    FROM submissions s
-    JOIN questions q ON q.id = s.question_id
-    WHERE s.user_id=?
-    ORDER BY s.id DESC LIMIT 10
-  `).all(sId);
+    const recentSubmissions = await dbAll(`
+      SELECT s.*, q.title question_title
+      FROM submissions s
+      JOIN questions q ON q.id = s.question_id
+      WHERE s.user_id=?
+      ORDER BY s.id DESC LIMIT 10
+    `, [sId]);
 
-  const notes = db.prepare(`
-    SELECT sn.*, u.name staff_name
-    FROM staff_notes sn
-    JOIN users u ON u.id = sn.staff_id
-    WHERE sn.student_id=?
-    ORDER BY sn.id DESC
-  `).all(sId);
+    const notes = await dbAll(`
+      SELECT sn.*, u.name staff_name
+      FROM staff_notes sn
+      JOIN users u ON u.id = sn.staff_id
+      WHERE sn.student_id=?
+      ORDER BY sn.id DESC
+    `, [sId]);
 
-  res.json({
-    ...u,
-    profile,
-    languageBelts,
-    solvedCount,
-    progressPercent,
-    completedTopics,
-    recentSubmissions,
-    notes
-  });
+    res.json({
+      ...u,
+      profile,
+      languageBelts,
+      solvedCount,
+      progressPercent,
+      completedTopics,
+      recentSubmissions,
+      notes
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.post("/api/staff/students/:id/notes", authMiddleware, requireRole("staff", "admin"), (req: AuthReq, res) => {
-  const sId = Number(req.params.id);
-  const { note } = req.body || {};
-  if (!note) return res.status(400).json({ error: "Note text required" });
+app.post("/api/staff/students/:id/notes", authMiddleware, requireRole("staff", "admin"), async (req: AuthReq, res) => {
+  try {
+    const sId = Number(req.params.id);
+    const { note } = req.body || {};
+    if (!note) return res.status(400).json({ error: "Note text required" });
 
-  db.prepare("INSERT INTO staff_notes(student_id, staff_id, note) VALUES(?, ?, ?)").run(sId, req.user.id, note);
-  res.json({ ok: true });
+    await dbRun("INSERT INTO staff_notes(student_id, staff_id, note) VALUES(?, ?, ?)", [sId, req.user.id, note]);
+    res.json({ ok: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.get("/api/admin/dashboard", authMiddleware, requireRole("admin"), (req, res) => {
-  const totalStudents = (db.prepare("SELECT COUNT(*) c FROM users WHERE role='student'").get() as any).c;
-  const totalStaff = (db.prepare("SELECT COUNT(*) c FROM users WHERE role='staff'").get() as any).c;
-  const totalLessons = (db.prepare("SELECT COUNT(*) c FROM topics").get() as any).c;
-  const totalQuestions = (db.prepare("SELECT COUNT(*) c FROM questions").get() as any).c;
-  const totalSubmissions = (db.prepare("SELECT COUNT(*) c FROM submissions").get() as any).c;
+app.get("/api/admin/dashboard", authMiddleware, requireRole("admin"), async (req, res) => {
+  try {
+    const totalStudents = Number((await dbGet("SELECT COUNT(*) c FROM users WHERE role='student'"))?.c || 0);
+    const totalStaff = Number((await dbGet("SELECT COUNT(*) c FROM users WHERE role='staff'"))?.c || 0);
+    const totalLessons = Number((await dbGet("SELECT COUNT(*) c FROM topics"))?.c || 0);
+    const totalQuestions = Number((await dbGet("SELECT COUNT(*) c FROM questions"))?.c || 0);
+    const totalSubmissions = Number((await dbGet("SELECT COUNT(*) c FROM submissions"))?.c || 0);
 
-  res.json({ totalStudents, totalStaff, totalLessons, totalQuestions, totalSubmissions });
+    res.json({ totalStudents, totalStaff, totalLessons, totalQuestions, totalSubmissions });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.get("/api/admin/users", authMiddleware, requireRole("admin"), (req, res) => {
-  res.json(db.prepare("SELECT id, name, email, role, active, created_at FROM users ORDER BY id DESC").all());
+app.get("/api/admin/users", authMiddleware, requireRole("admin"), async (req, res) => {
+  try {
+    res.json(await dbAll("SELECT id, name, email, role, active, created_at FROM users ORDER BY id DESC"));
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.get("/api/admin/content", authMiddleware, requireRole("admin"), (req, res) => {
-  const languages = db.prepare("SELECT * FROM languages").all();
-  const belts = db.prepare("SELECT * FROM belts ORDER BY sort_order ASC").all();
-  const topics = db.prepare("SELECT t.*, l.name language_name, b.name belt_name FROM topics t JOIN languages l ON l.id = t.language_id JOIN belts b ON b.id = t.belt_id ORDER BY t.id DESC").all();
-  const questions = db.prepare("SELECT q.*, t.name topic_name, l.name language_name, b.name belt_name FROM questions q JOIN topics t ON t.id = q.topic_id JOIN languages l ON l.id = t.language_id JOIN belts b ON b.id = t.belt_id ORDER BY q.id DESC").all();
-  res.json({ languages, belts, topics, questions });
+app.get("/api/admin/content", authMiddleware, requireRole("admin"), async (req, res) => {
+  try {
+    const languages = await dbAll("SELECT * FROM languages");
+    const belts = await dbAll("SELECT * FROM belts ORDER BY sort_order ASC");
+    const topics = await dbAll("SELECT t.*, l.name language_name, b.name belt_name FROM topics t JOIN languages l ON l.id = t.language_id JOIN belts b ON b.id = t.belt_id ORDER BY t.id DESC");
+    const questions = await dbAll("SELECT q.*, t.name topic_name, l.name language_name, b.name belt_name FROM questions q JOIN topics t ON t.id = q.topic_id JOIN languages l ON l.id = t.language_id JOIN belts b ON b.id = t.belt_id ORDER BY q.id DESC");
+    res.json({ languages, belts, topics, questions });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.get("/{*path}", (req, res) => {
