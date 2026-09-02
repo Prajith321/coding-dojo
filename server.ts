@@ -1,8 +1,10 @@
+import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import cookieParser from "cookie-parser";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import { createClient } from "@supabase/supabase-js";
 import { DatabaseSync } from "node:sqlite";
 import { spawn } from "child_process";
 import fs from "fs";
@@ -12,6 +14,10 @@ import path from "path";
 export const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const JWT_SECRET = process.env.JWT_SECRET || "local-coding-dojo-secret-key-2026";
+
+const SUPABASE_URL = process.env.SUPABASE_URL || "https://zpgwsqxaxvuxaaiecpja.supabase.co";
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_PUBLISHABLE_KEY || "";
+export const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 const dbPath = process.env.VERCEL
   ? path.join(os.tmpdir(), "dojo.sqlite")
